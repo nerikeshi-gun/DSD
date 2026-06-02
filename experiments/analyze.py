@@ -165,10 +165,10 @@ def main():
     tokenizer, model = load_gemma(args.model)
 
     cfg = model.config
-    # Gemma3 は multi-modal なので text_config を参照
+    # Gemma3 は multi-modal なので text_config を参照 (オブジェクト属性としてアクセス)
     if hasattr(cfg, 'text_config'):
-        hidden_dim = cfg.text_config['hidden_size']
-        vocab_size = cfg.text_config['vocab_size']
+        hidden_dim = cfg.text_config.hidden_size
+        vocab_size = cfg.text_config.vocab_size
     else:
         hidden_dim = cfg.hidden_size
         vocab_size = cfg.vocab_size
