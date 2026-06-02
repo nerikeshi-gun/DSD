@@ -137,9 +137,16 @@ def survival_scan(
         # surviving candidates:
         #   partial_logit[v] + remaining_B > top1_logit
         #   ⟺  partial_logit[v] > top1_logit - remaining_B
-        threshold  = top1_logit - remaining_B
-        survivors  = (partial_logit > threshold).nonzero(as_tuple=True)[0]
+        threshold   = top1_logit - remaining_B
+        survivors   = (partial_logit > threshold).nonzero(as_tuple=True)[0]
         n_survivors = int(survivors.shape[0])
+        survivor_pct = n_survivors / vocab_size
+
+        # --- 診断統計 ---
+        min_logit  = float(partial_logit.min())
+        max_logit  = float(partial_logit.max())
+        mean_logit = float(partial_logit.mean())
+        std_logit  = float(partial_logit.std())
 
         # ID 一覧 (上位 MAX_CANDIDATES_STORED 件のみ保存)
         if n_survivors <= MAX_CANDIDATES_STORED:
@@ -155,10 +162,18 @@ def survival_scan(
             "dim_done":         dim_done,
             "hidden_dim":       H,
             "survivor_count":   n_survivors,
+            "survivor_pct":     round(survivor_pct, 6),
             "remaining_bound":  round(remaining_B, 6),
+            "threshold":        round(threshold, 6),
             "margin":           round(margin, 6),
+            "top1_logit":       round(top1_logit, 6),
+            "top2_logit":       round(top2_logit, 6),
             "top1_id":          top1_id,
             "top2_id":          top2_id,
+            "min_logit":        round(min_logit, 6),
+            "max_logit":        round(max_logit, 6),
+            "mean_logit":       round(mean_logit, 6),
+            "std_logit":        round(std_logit, 6),
             "candidate_ids":    cand_ids,
         })
 
@@ -182,15 +197,27 @@ def eval_one(prompt, tokenizer, model, W, bias) -> dict:
     records = survival_scan(h, W, bias)
     elapsed = time.time() - t0
 
-    # Decode top tokens for display
+    # 診断付きコンソール表示
     print(f"Prompt : {prompt!r}  ({elapsed:.1f}s)")
-    print(f"  {'ratio':>6}  {'survivors':>10}  {'margin':>8}  {'top1_token':>15}")
+    hdr = (f"  {'ratio':>5}  {'survivors':>8}  {'surv%':>6}  "
+           f"{'B':>8}  {'top1':>8}  {'threshold':>9}  "
+           f"{'min':>8}  {'mean':>8}  {'std':>7}  top1_token")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
     for r in records:
         top1_tok = tokenizer.decode([r["top1_id"]])
-        print(f"  {r['observed_ratio']*100:5.0f}%  "
-              f"{r['survivor_count']:>10,}  "
-              f"{r['margin']:8.4f}  "
-              f"{top1_tok!r:>15}")
+        print(
+            f"  {r['observed_ratio']*100:4.0f}%"
+            f"  {r['survivor_count']:>8,}"
+            f"  {r['survivor_pct']*100:5.1f}%"
+            f"  {r['remaining_bound']:8.2f}"
+            f"  {r['top1_logit']:8.3f}"
+            f"  {r['threshold']:9.3f}"
+            f"  {r['min_logit']:8.3f}"
+            f"  {r['mean_logit']:8.3f}"
+            f"  {r['std_logit']:7.3f}"
+            f"  {top1_tok!r}"
+        )
     print()
 
     # Annotate candidate_ids with token text (top-20 only for readability)
@@ -207,8 +234,16 @@ def eval_one(prompt, tokenizer, model, W, bias) -> dict:
             "dim_done":             r["dim_done"],
             "hidden_dim":           r["hidden_dim"],
             "survivor_count":       r["survivor_count"],
+            "survivor_pct":         r["survivor_pct"],
             "remaining_bound":      r["remaining_bound"],
+            "threshold":            r["threshold"],
+            "top1_logit":           r["top1_logit"],
+            "top2_logit":           r["top2_logit"],
             "margin":               r["margin"],
+            "min_logit":            r["min_logit"],
+            "max_logit":            r["max_logit"],
+            "mean_logit":           r["mean_logit"],
+            "std_logit":            r["std_logit"],
             "top1_id":              r["top1_id"],
             "top1_token":           top1_tok,
             "top2_id":              r["top2_id"],
