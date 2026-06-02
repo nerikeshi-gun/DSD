@@ -1,0 +1,135 @@
+# DSD Theory
+
+## Core Principle
+
+DSD (Dynamic Sparse Decoding) is based on a simple condition:
+
+Δ > B
+
+where:
+
+* Δ = score difference between current Top-1 and Top-2
+* B = maximum possible contribution of all remaining unread observations
+
+When:
+
+Δ > B
+
+rank reversal becomes impossible.
+
+Therefore:
+
+* additional observation is unnecessary
+* additional memory fetch is unnecessary
+* computation can stop
+
+---
+
+## Fundamental Difference from Early Exit
+
+Early Exit:
+
+* confidence based
+* probabilistic
+* approximation
+
+DSD:
+
+* rank-reversal proof
+* deterministic
+* exact Top-1 preservation
+
+DSD does not estimate correctness.
+
+DSD proves that correctness is already determined.
+
+---
+
+## Observation Scheduling
+
+Traditional inference:
+
+Read everything
+→ Compute everything
+→ Decide
+
+DSD:
+
+Observe
+→ Update Δ
+→ Update B
+→ Prove rank certainty
+→ Stop observation
+
+The objective is not compute reduction.
+
+The objective is:
+
+Fastest proof of rank certainty.
+
+---
+
+## Signed Contribution
+
+For Top-1 and Top-2 candidates:
+
+c_i = h_i (W_top1,i - W_top2,i)
+
+Positive contribution:
+
+c_i > 0
+
+Negative contribution:
+
+c_i < 0
+
+Signed ordering places positive evidence first.
+
+---
+
+## Negative-Only Bound
+
+After positive contributions are observed first:
+
+Remaining dimensions mainly contain negative evidence.
+
+Bound becomes:
+
+B_neg = Σ |c_i|
+
+for remaining negative contributions.
+
+This produces earlier stopping while preserving correctness.
+
+---
+
+## Current Interpretation
+
+DSD should not be viewed as sparse inference.
+
+DSD is better understood as:
+
+Confidence Field Dynamics
+
+The optimization target is:
+
+maximize(dΔ/dt)
+
+Grow confidence as quickly as possible and prove certainty as early as possible.
+
+---
+
+## Long-Term Direction
+
+* Adaptive Chunk
+* Active Token Scheduler
+* Logit Referenced Prefetch
+* Top-k Boundary Guarantee
+* Tile Local Stop
+* Memory Observation Denial
+
+DSD is ultimately a memory-first architecture.
+
+The central question is:
+
+"Do we really need to read this memory?"
