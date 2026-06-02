@@ -95,7 +95,7 @@ def dense_predict(h, W, bias=None) -> int:
 # 1 プロンプト評価
 # ---------------------------------------------------------------------------
 
-def eval_one(prompt, tokenizer, model, W, bias) -> dict:
+def eval_one(prompt, tokenizer, model, W, bias, interval: int = TRAJECTORY_INTERVAL) -> dict:
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
     input_ids = input_ids.to(next(model.parameters()).device)
 
@@ -107,7 +107,7 @@ def eval_one(prompt, tokenizer, model, W, bias) -> dict:
     dense_token = tokenizer.decode([dense_id])
 
     t1 = time.time()
-    result = dsd_predict(h, W, bias, trajectory_interval=TRAJECTORY_INTERVAL)
+    result = dsd_predict(h, W, bias, trajectory_interval=interval)
     dsd_time = time.time() - t1
 
     dsd_token = tokenizer.decode([result["token_id"]])
@@ -185,12 +185,11 @@ def main():
     print(f"  W.shape = {W.shape}  dtype={W.dtype}  ({time.time()-t_prep:.1f}s)\n")
 
     # --- 評価ループ ---
-    global TRAJECTORY_INTERVAL
-    TRAJECTORY_INTERVAL = args.interval
+    interval = args.interval
 
     all_results = []
     for prompt in prompts:
-        rec = eval_one(prompt, tokenizer, model, W, bias)
+        rec = eval_one(prompt, tokenizer, model, W, bias, interval)
         all_results.append(rec)
 
     # --- サマリ計算 ---
