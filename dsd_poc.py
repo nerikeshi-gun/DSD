@@ -47,18 +47,27 @@ def dsd_predict(
     h: torch.Tensor,            # (hidden_dim,) float32
     W: torch.Tensor,            # (vocab_size, hidden_dim) float32
     bias: Optional[torch.Tensor] = None,  # (vocab_size,) or None
+    trajectory_interval: int = 0,  # >0 でその次元間隔ごとにトラジェクトリを記録
 ) -> dict:
     """
     h を hidden_dim 方向に逐次スキャンして greedy top1 を早期確定する。
 
+    trajectory_interval > 0 の場合、その間隔ごとに
+    {"dim", "delta", "bound", "ratio"} を trajectory リストに記録する。
+    停止条件・アルゴリズム本体は変更しない。
+
     Returns:
         {
-          "token_id":  int,   確定トークン ID
-          "stop_dim":  int,   停止した次元インデックス (1-indexed)
+          "token_id":  int,
+          "stop_dim":  int,   (1-indexed)
           "hidden_dim": int,
-          "skip_rate": float, 1 - stop_dim/hidden_dim
-          "full_logit_top1": int,  フル計算での top1 (一致検証用)
+          "skip_rate": float,
+          "full_logit_top1": int,
           "match": bool,
+          "trajectory": list[dict],  (trajectory_interval > 0 の時のみ)
+          "max_delta": float,
+          "final_delta": float,
+          "stopping_ratio": float,   delta / (2B) at stop_dim
         }
     """
     hidden_dim = h.shape[0]
@@ -80,42 +89,79 @@ def dsd_predict(
     h_abs = h.abs()                               # (hidden_dim,)
 
     # --- 逐次スキャン ---
-    # partial_logit を次元ごとに加算して top1/top2 を更新
     if bias is not None:
         partial_logit = bias.clone()
     else:
         partial_logit = torch.zeros(vocab_size, dtype=torch.float32)
 
-    stop_dim = hidden_dim  # デフォルトは最後まで
+    stop_dim = hidden_dim
+    record_traj = trajectory_interval > 0
+    trajectory = []
+    max_delta = 0.0
+    last_delta = 0.0
+    stopping_ratio = 0.0
 
     for i in range(hidden_dim):
-        # i 次元目を加算
         partial_logit.add_(W[:, i] * h[i])
 
         # top1 / top2
-        top2_vals, top2_idx = partial_logit.topk(2)
+        top2_vals, _ = partial_logit.topk(2)
         delta = float(top2_vals[0] - top2_vals[1])
 
         # 残り上限 B
         # B = sum_{j>i} max_v|W[v,j]| * |h[j]|  (各ロジット単体への最大変化)
         # 差 (top1 - top2) の最悪変化 = top2 が +B、top1 が -B → 計 2B
         B = float(compute_remaining_bound(weight_col_max, h_abs, i + 1))
+        two_B = 2.0 * B
 
-        if delta > 2.0 * B:
+        max_delta = max(max_delta, delta)
+        last_delta = delta
+
+        # トラジェクトリ記録 (チェックポイントのみ)
+        if record_traj and ((i + 1) % trajectory_interval == 0 or i == hidden_dim - 1):
+            trajectory.append({
+                "dim": i + 1,
+                "delta": round(delta, 6),
+                "bound": round(two_B, 6),
+                "ratio": round(delta / two_B, 6) if two_B > 0 else None,
+            })
+
+        if delta > two_B:
             stop_dim = i + 1  # 1-indexed
+            stopping_ratio = delta / two_B if two_B > 0 else None
+            # 停止点もトラジェクトリに含める (チェックポイントと重複する場合はスキップ)
+            if record_traj:
+                if not trajectory or trajectory[-1]["dim"] != stop_dim:
+                    trajectory.append({
+                        "dim": stop_dim,
+                        "delta": round(delta, 6),
+                        "bound": round(two_B, 6),
+                        "ratio": round(stopping_ratio, 6) if stopping_ratio is not None else None,
+                    })
             break
+
+    if stopping_ratio == 0.0:
+        # 最後まで走った場合
+        two_B_final = 0.0  # B=0 at end
+        stopping_ratio = None  # bound=0 なので比は未定義
 
     token_id = int(partial_logit.argmax())
     skip_rate = 1.0 - stop_dim / hidden_dim
 
-    return {
+    result = {
         "token_id": token_id,
         "stop_dim": stop_dim,
         "hidden_dim": hidden_dim,
         "skip_rate": skip_rate,
         "full_logit_top1": full_top1,
         "match": token_id == full_top1,
+        "max_delta": round(max_delta, 6),
+        "final_delta": round(last_delta, 6),
+        "stopping_ratio": round(stopping_ratio, 6) if stopping_ratio is not None else None,
     }
+    if record_traj:
+        result["trajectory"] = trajectory
+    return result
 
 
 # ---------------------------------------------------------------------------
