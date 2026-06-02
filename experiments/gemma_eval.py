@@ -69,13 +69,16 @@ def load_gemma(model_name: str = MODEL_NAME):
 def get_final_hidden(model, input_ids: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         out = model(input_ids=input_ids, output_hidden_states=True)
-    return out.hidden_states[-1][0, -1, :].float().cpu()
+    # .cpu() 先に呼ぶことで GPU 上に float32 コピーを作らない
+    return out.hidden_states[-1][0, -1, :].detach().cpu().float()
 
 
 def get_lm_head(model):
     lm_head = model.lm_head
-    W = lm_head.weight.detach().float().cpu()
-    bias = lm_head.bias.detach().float().cpu() if lm_head.bias is not None else None
+    # .float().cpu() は GPU 上に float32 コピーを生成して OOM を引き起こす。
+    # .cpu().float() で bfloat16 のまま CPU に転送してから変換する。
+    W = lm_head.weight.detach().cpu().float()
+    bias = lm_head.bias.detach().cpu().float() if lm_head.bias is not None else None
     return W, bias
 
 

@@ -48,13 +48,13 @@ def load_gemma(model_name: str):
 def get_final_hidden(model, input_ids):
     with torch.no_grad():
         out = model(input_ids=input_ids, output_hidden_states=True)
-    return out.hidden_states[-1][0, -1, :].float().cpu()
+    return out.hidden_states[-1][0, -1, :].detach().cpu().float()
 
 
 def get_lm_head(model):
     lm = model.lm_head
-    W = lm.weight.detach().float().cpu()
-    bias = lm.bias.detach().float().cpu() if lm.bias is not None else None
+    W = lm.weight.detach().cpu().float()
+    bias = lm.bias.detach().cpu().float() if lm.bias is not None else None
     return W, bias
 
 
