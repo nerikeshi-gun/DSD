@@ -37,7 +37,7 @@ EVAL_PROMPTS = [
     "The opposite of hot is",
 ]
 
-MODEL_NAME = "google/gemma-3-12b-it"
+MODEL_NAME = "/home/kaneyama/models/gemma-3-12b-it"
 
 
 # ---------------------------------------------------------------------------
@@ -48,9 +48,10 @@ def load_gemma(model_name: str = MODEL_NAME):
     print(f"[load] {model_name}")
     print("  torch_dtype=bfloat16, device_map=auto")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
+        local_files_only=True,
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
@@ -184,6 +185,17 @@ def main():
 
     # --- ロード ---
     tokenizer, model = load_gemma(args.model)
+
+    # --- モデル情報を表示 ---
+    cfg = model.config
+    hidden_dim = cfg.hidden_size
+    vocab_size = cfg.vocab_size
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[model info]")
+    print(f"  hidden_dim  = {hidden_dim}")
+    print(f"  vocab_size  = {vocab_size}")
+    print(f"  parameters  = {n_params/1e9:.2f}B")
+    print()
 
     # lm_head は一度だけ CPU float32 に変換して使い回す
     print("[prep] lm_head を CPU float32 に変換中...")
