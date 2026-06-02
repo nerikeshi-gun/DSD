@@ -165,8 +165,13 @@ def main():
     tokenizer, model = load_gemma(args.model)
 
     cfg = model.config
-    hidden_dim = cfg.hidden_size
-    vocab_size = cfg.vocab_size
+    # Gemma3 は multi-modal なので text_config を参照
+    if hasattr(cfg, 'text_config'):
+        hidden_dim = cfg.text_config['hidden_size']
+        vocab_size = cfg.text_config['vocab_size']
+    else:
+        hidden_dim = cfg.hidden_size
+        vocab_size = cfg.vocab_size
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\n[model info]  hidden_dim={hidden_dim}  vocab_size={vocab_size}  params={n_params/1e9:.2f}B\n")
 
