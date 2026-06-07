@@ -1,17 +1,18 @@
 """
-experiments/dsd_runtime.py  --  DSD ランタイム実装
+experiments/dsd_runtime.py  --  DSD ランタイム (GPU 版)
 
-lm_head の W @ h をタイル単位で逐次実行し、Δ > 2B に達した時点で
-ループを break する。break 以降のタイルは計算しない。
+W も hidden も CUDA テンソルのまま処理する。
+CPU 転送なし。Δ, B, topk すべて CUDA 上で実行。
 
-これは「停止位置の事後分析」ではない:
-  - DSD ループが break した後、W の残タイルには一切アクセスしない
-  - partial_logit の argmax がそのままランタイム出力 (top1 トークン)
-  - 正解検証 (dense W @ h) は計測ループとは別パスで実施する
+目的:
+  DSD アルゴリズム固有のコスト (topk・累積・Δ>2B 判定) を
+  CPU 転送コストと混ぜずに計測する。
 
-比較構造:
-  [ランタイムパス]  model() → h → DSD tile loop (break あり) → token_id
-  [検証パス]       token_id vs (W @ h).argmax()  ← 計測時間から除外
+実行フロー:
+  [step1] transformer forward  → h_batch: (N, H) CUDA bfloat16
+  [step2] precompute           → order, h_ord, W_ord, suffix_B: すべて CUDA
+  [step3] DSD ランタイム計測   → tile ループ + break; 後続タイルは計算しない
+  [step4] dense 計測 (検証用)  → W @ h の全量; 別パスで実施
 
 出力:
   dsd_runtime.json
@@ -56,7 +57,7 @@ DEFAULT_PROMPTS = [
 
 
 # ---------------------------------------------------------------------------
-# Model utilities
+# Model utilities  -- W も h も GPU のまま
 # ---------------------------------------------------------------------------
 
 def load_gemma(model_name):
@@ -70,14 +71,18 @@ def load_gemma(model_name):
     return tokenizer, model
 
 
-def get_lm_head(model):
+def get_lm_head_gpu(model) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """W と bias を GPU float32 のまま返す。CPU に移さない。"""
     lm   = model.lm_head
-    W    = lm.weight.detach().cpu().float()
-    bias = lm.bias.detach().cpu().float() if lm.bias is not None else None
+    device = next(model.parameters()).device
+    W    = lm.weight.detach().to(device=device, dtype=torch.float32)
+    bias = (lm.bias.detach().to(device=device, dtype=torch.float32)
+            if lm.bias is not None else None)
     return W, bias
 
 
-def batch_hidden_states(model, tokenizer, prompts: list[str]) -> torch.Tensor:
+def batch_hidden_states_gpu(model, tokenizer, prompts: list[str]) -> torch.Tensor:
+    """最終層 hidden state を GPU float32 のまま返す。CPU に移さない。"""
     device = next(model.parameters()).device
     enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
     input_ids      = enc["input_ids"].to(device)
@@ -88,56 +93,83 @@ def batch_hidden_states(model, tokenizer, prompts: list[str]) -> torch.Tensor:
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
-    last_hidden = out.hidden_states[-1]
-    seq_lens    = attention_mask.sum(dim=1) - 1
+    last_hidden = out.hidden_states[-1]                      # (N, seq, H) bfloat16 GPU
+    seq_lens    = attention_mask.sum(dim=1) - 1              # (N,)
     h_batch = last_hidden[torch.arange(last_hidden.size(0), device=device), seq_lens, :]
-    return h_batch.detach().cpu().float()
+    return h_batch.detach().to(dtype=torch.float32)          # (N, H) float32 GPU
 
 
 # ---------------------------------------------------------------------------
-# DSD ランタイム: lm_head タイル単位実行 + Δ > 2B で break
+# 事前計算 (計測対象外)
 # ---------------------------------------------------------------------------
 
-def dsd_runtime_single(
-    h: torch.Tensor,
-    W: torch.Tensor,
-    bias,
+def precompute_ordering_gpu(
+    h_batch: torch.Tensor,   # (N, H) float32 GPU
+    W: torch.Tensor,          # (V, H) float32 GPU
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """
+    bound_first 並び替えと suffix_B を全ユーザー分計算する。
+    実機では W の静的スケジューラが事前決定するため計測対象外とする。
+    すべての演算を CUDA 上で完結させる。
+    """
+    N = h_batch.shape[0]
+    prepared = []
+    for i in range(N):
+        h     = h_batch[i]                                   # (H,) GPU
+        order = order_bound_first(h, W)                      # (H,) GPU long
+        h_ord = h[order]                                     # (H,) GPU
+        W_ord = W[:, order]                                  # (V, H) GPU
+
+        weight_col_max = W_ord.abs().max(dim=0).values       # (H,) GPU
+        suffix_B = (weight_col_max * h_ord.abs()).flip(0).cumsum(0).flip(0)  # (H,) GPU
+
+        prepared.append((h_ord, W_ord, suffix_B))
+    return prepared
+
+
+# ---------------------------------------------------------------------------
+# DSD ランタイム (GPU 上で tile-by-tile 実行)
+# ---------------------------------------------------------------------------
+
+def dsd_runtime_single_gpu(
+    bias: torch.Tensor | None,   # (V,) float32 GPU  または None
     chunk_size: int,
-    suffix_B: torch.Tensor,     # 事前計算済 suffix bound (並び替え後)
-    h_ord: torch.Tensor,        # h[order]
-    W_ord: torch.Tensor,        # W[:, order]
+    suffix_B: torch.Tensor,      # (H,) float32 GPU
+    h_ord: torch.Tensor,         # (H,) float32 GPU
+    W_ord: torch.Tensor,         # (V, H) float32 GPU
     n_tiles: int,
 ) -> tuple[int, int, float]:
     """
-    lm_head をタイル単位で実行し Δ > 2B で break する。
-
-    break した瞬間に後続タイルへのアクセスは行わない。
-    dense W @ h は呼び出し側の検証パスで別途計算する。
+    lm_head を tile-by-tile で CUDA 上で実行し Δ > 2B で break する。
+    break 後の列には一切アクセスしない。
+    Δ, B, topk すべて CUDA テンソルのまま評価する。
 
     Returns: (token_id, stop_tile, skip_pct)
     """
-    H          = h.shape[0]
-    vocab_size = W.shape[0]
+    H         = h_ord.shape[0]
+    vocab_size = W_ord.shape[0]
 
-    partial_logit = bias.clone() if bias is not None else torch.zeros(vocab_size)
-    stop_tile     = n_tiles
+    partial_logit = (bias.clone() if bias is not None
+                     else torch.zeros(vocab_size, dtype=torch.float32, device=h_ord.device))
+    stop_tile = n_tiles
 
     for tile in range(1, n_tiles + 1):
         dim_start = (tile - 1) * chunk_size
         dim_end   = min(tile * chunk_size, H)
 
-        # このタイルの次元だけを読む
-        for i in range(dim_start, dim_end):
-            partial_logit.add_(W_ord[:, i] * h_ord[i])
+        # このタイルの列だけを CUDA 上でまとめて GEMV
+        partial_logit.add_(
+            W_ord[:, dim_start:dim_end] @ h_ord[dim_start:dim_end]
+        )
 
-        dim_done = dim_end
-        top2     = partial_logit.topk(2)
-        delta    = float(top2.values[0] - top2.values[1])
-        B        = float(suffix_B[dim_done]) if dim_done < H else 0.0
+        # Δ と B を CUDA 上で評価
+        top2  = partial_logit.topk(2)
+        delta = top2.values[0] - top2.values[1]              # CUDA scalar
+        B     = suffix_B[dim_end] if dim_end < H else suffix_B.new_zeros(())
 
-        if delta > 2.0 * B:
+        if delta > 2.0 * B:                                  # .item() 不要: Python bool 評価
             stop_tile = tile
-            break   # 以降のタイルは計算しない
+            break
 
     token_id = int(partial_logit.argmax())
     skip_pct = round((n_tiles - stop_tile) / n_tiles * 100, 2)
@@ -145,62 +177,28 @@ def dsd_runtime_single(
 
 
 # ---------------------------------------------------------------------------
-# 事前計算: order, h_ord, W_ord, suffix_B を N ユーザー分まとめて準備
-# ---------------------------------------------------------------------------
-
-def precompute_ordering(h_batch: torch.Tensor, W: torch.Tensor):
-    """
-    bound_first 並び替えと suffix_B を全ユーザー分計算する。
-    ランタイム計測の前に済ませておくことで計測対象から除外する。
-    (実機では W の並び替えは静的スケジューラが事前に決定する)
-    """
-    N = h_batch.shape[0]
-    prepared = []
-    for i in range(N):
-        h     = h_batch[i]
-        order = order_bound_first(h, W)
-        h_ord = h[order]
-        W_ord = W[:, order]
-
-        weight_col_max = W_ord.abs().max(dim=0).values
-        h_abs          = h_ord.abs()
-        suffix_B       = (weight_col_max * h_abs).flip(0).cumsum(0).flip(0)
-
-        prepared.append((h_ord, W_ord, suffix_B))
-    return prepared
-
-
-# ---------------------------------------------------------------------------
-# Alive curve
+# Alive curve / Plot
 # ---------------------------------------------------------------------------
 
 def compute_alive_curve(stop_tiles: list[int], n_tiles: int) -> list[int]:
     return [sum(1 for st in stop_tiles if st >= t) for t in range(1, n_tiles + 1)]
 
 
-# ---------------------------------------------------------------------------
-# Plot
-# ---------------------------------------------------------------------------
-
 def plot_runtime(alive: list[int], speedups: list[float],
                  n_users: int, n_tiles: int, out_path: str):
     tiles = list(range(1, n_tiles + 1))
-
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle(
-        f"DSD Runtime  (N={n_users}, bound_first, lm_head tile-by-tile early stop)",
+        f"DSD Runtime GPU  (N={n_users}, bound_first, lm_head tile-by-tile CUDA)",
         fontsize=12, fontweight="bold",
     )
 
     ax = axes[0]
     ax.fill_between(tiles, alive, alpha=0.25, color="#4C72B0")
     ax.plot(tiles, alive, color="#4C72B0", lw=2)
-    ax.set_xlabel("Tile index")
-    ax.set_ylabel("Alive users")
+    ax.set_xlabel("Tile index"); ax.set_ylabel("Alive users")
     ax.set_title("Alive users per tile  (absolute)")
-    ax.set_xlim(1, n_tiles)
-    ax.set_ylim(0, n_users * 1.05)
-    ax.grid(alpha=0.3)
+    ax.set_xlim(1, n_tiles); ax.set_ylim(0, n_users * 1.05); ax.grid(alpha=0.3)
     for pct, col in [(0.5, "#DD8452"), (0.1, "#C44E52")]:
         thresh  = n_users * pct
         crosses = [t for t, a in zip(tiles, alive) if a <= thresh]
@@ -216,13 +214,10 @@ def plot_runtime(alive: list[int], speedups: list[float],
     ax2.plot(tiles, alive_pct, color="#55A868", lw=2)
     ax2.axhline(50, color="#DD8452", ls="--", lw=0.8, label="50%")
     ax2.axhline(10, color="#C44E52", ls="--", lw=0.8, label="10%")
-    ax2.set_xlabel("Tile index")
-    ax2.set_ylabel("Alive users (%)")
+    ax2.set_xlabel("Tile index"); ax2.set_ylabel("Alive users (%)")
     ax2.set_title("Alive users per tile  (percentage)")
-    ax2.set_xlim(1, n_tiles)
-    ax2.set_ylim(0, 105)
-    ax2.legend(fontsize=9)
-    ax2.grid(alpha=0.3)
+    ax2.set_xlim(1, n_tiles); ax2.set_ylim(0, 105)
+    ax2.legend(fontsize=9); ax2.grid(alpha=0.3)
 
     ax3 = axes[2]
     ax3.hist(speedups, bins=30, color="#4C72B0", alpha=0.7, edgecolor="white")
@@ -231,9 +226,8 @@ def plot_runtime(alive: list[int], speedups: list[float],
                 label=f"mean={mean_sp:.2f}x")
     ax3.set_xlabel("Speedup (dense / dsd)")
     ax3.set_ylabel("Count")
-    ax3.set_title("lm_head speedup  (dense wall time / dsd wall time)")
-    ax3.legend(fontsize=9)
-    ax3.grid(alpha=0.3)
+    ax3.set_title("lm_head speedup  (dense / dsd wall time, CUDA)")
+    ax3.legend(fontsize=9); ax3.grid(alpha=0.3)
 
     plt.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -247,7 +241,7 @@ def plot_runtime(alive: list[int], speedups: list[float],
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="DSD runtime: lm_head tile-by-tile early stop")
+    parser = argparse.ArgumentParser(description="DSD runtime GPU: lm_head tile-by-tile CUDA")
     parser.add_argument("--model",      default=MODEL_NAME)
     parser.add_argument("--n_batch",    type=int, default=N_BATCH)
     parser.add_argument("--chunk_size", type=int, default=CHUNK_SIZE)
@@ -262,6 +256,7 @@ def main():
     prompts = [base[i % len(base)] for i in range(n_batch)]
 
     tokenizer, model = load_gemma(args.model)
+    device = next(model.parameters()).device
 
     cfg = model.config
     if hasattr(cfg, "text_config"):
@@ -273,73 +268,83 @@ def main():
     n_tiles  = math.ceil(hidden_dim / chunk_size)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model]  hidden_dim={hidden_dim}  vocab_size={vocab_size}  "
-          f"params={n_params/1e9:.2f}B")
+          f"params={n_params/1e9:.2f}B  device={device}")
     print(f"[batch]  n_users={n_batch}  chunk_size={chunk_size}  n_tiles={n_tiles}\n")
 
-    print("[prep] lm_head を CPU float32 に変換中...")
+    # --- lm_head を GPU float32 に変換 (CPU に移さない) ---
+    print("[prep] lm_head を GPU float32 に変換中...")
     t0 = time.time()
-    W, bias = get_lm_head(model)
-    print(f"  W.shape={W.shape}  ({time.time()-t0:.1f}s)\n")
+    W, bias = get_lm_head_gpu(model)
+    print(f"  W.shape={W.shape}  device={W.device}  dtype={W.dtype}  ({time.time()-t0:.1f}s)\n")
 
-    # --- Step 1: transformer forward (h を得るために全実行; DSD 対象外) ---
+    # --- Step 1: transformer forward ---
     print(f"[step1/forward] {n_batch} ユーザーを一括 forward 中...")
+    torch.cuda.synchronize(device)
     t_fwd = time.time()
-    h_batch = batch_hidden_states(model, tokenizer, prompts)
+    h_batch = batch_hidden_states_gpu(model, tokenizer, prompts)
+    torch.cuda.synchronize(device)
     fwd_elapsed = time.time() - t_fwd
-    print(f"  h_batch.shape={tuple(h_batch.shape)}  ({fwd_elapsed:.1f}s)\n")
+    print(f"  h_batch: shape={tuple(h_batch.shape)}  device={h_batch.device}  "
+          f"dtype={h_batch.dtype}  ({fwd_elapsed:.1f}s)\n")
 
-    # --- Step 2: 事前計算 (並び替え + suffix_B; 計測対象外) ---
-    print("[step2/precompute] bound_first 並び替えと suffix_B を計算中...")
+    # --- Step 2: 事前計算 (計測対象外) ---
+    print("[step2/precompute] bound_first 並び替え + suffix_B (CUDA) ...")
+    torch.cuda.synchronize(device)
     t_pre = time.time()
-    prepared = precompute_ordering(h_batch, W)
+    prepared = precompute_ordering_gpu(h_batch, W)
+    torch.cuda.synchronize(device)
     print(f"  ({time.time()-t_pre:.1f}s)\n")
 
     # --- Step 3: DSD ランタイム計測 ---
-    # lm_head を tile-by-tile で実行し Δ > 2B で break する。
-    # dense W @ h はここでは計算しない。
-    print("[step3/dsd-runtime] lm_head tile-by-tile early stop ...")
-    print("  Δ > 2B に達した時点で break; 後続タイルは計算しない\n")
+    print("[step3/dsd] lm_head tile-by-tile CUDA early stop ...")
+    print("  Δ > 2B で break; 後続タイルは計算しない\n")
 
     dsd_token_ids = []
     stop_tiles    = []
-    skip_pcts     = []
+    skip_pcts_    = []
     dsd_times     = []
 
+    torch.cuda.synchronize(device)
     t_loop = time.time()
     for i in range(n_batch):
         h_ord, W_ord, suffix_B = prepared[i]
 
+        torch.cuda.synchronize(device)
         t0 = time.perf_counter()
-        token_id, stop_tile, skip_pct = dsd_runtime_single(
-            h_batch[i], W, bias, chunk_size,
-            suffix_B, h_ord, W_ord, n_tiles,
+        token_id, stop_tile, skip_pct = dsd_runtime_single_gpu(
+            bias, chunk_size, suffix_B, h_ord, W_ord, n_tiles,
         )
+        torch.cuda.synchronize(device)
         elapsed_i = time.perf_counter() - t0
 
         dsd_token_ids.append(token_id)
         stop_tiles.append(stop_tile)
-        skip_pcts.append(skip_pct)
+        skip_pcts_.append(skip_pct)
         dsd_times.append(elapsed_i)
 
         if (i + 1) % max(1, n_batch // 20) == 0 or (i + 1) == n_batch:
-            avg_skip = sum(skip_pcts) / len(skip_pcts)
-            avg_dsd  = sum(dsd_times) / len(dsd_times)
+            avg_skip = sum(skip_pcts_) / len(skip_pcts_)
+            avg_dsd  = sum(dsd_times)  / len(dsd_times)
             print(f"  [{i+1:4d}/{n_batch}]  "
                   f"avg_skip={avg_skip:.1f}%  "
-                  f"avg_dsd_time={avg_dsd*1000:.2f}ms  "
+                  f"avg_dsd={avg_dsd*1000:.2f}ms  "
                   f"elapsed={time.time()-t_loop:.1f}s")
 
+    torch.cuda.synchronize(device)
     dsd_wall = time.time() - t_loop
 
-    # --- Step 4: dense 計測 (検証・比較用; ランタイム計測とは別) ---
-    print("\n[step4/dense] dense W @ h を計測 (検証用, ランタイムとは別パス) ...")
+    # --- Step 4: dense 計測 (検証・比較用; 別パス) ---
+    print("\n[step4/dense] dense W @ h 計測 (検証用, 別パス) ...")
     dense_token_ids = []
     dense_times     = []
     for i in range(n_batch):
+        h = h_batch[i]
+        torch.cuda.synchronize(device)
         t0 = time.perf_counter()
-        logit = W @ h_batch[i]
+        logit = W @ h
         if bias is not None:
             logit = logit + bias
+        torch.cuda.synchronize(device)
         dense_times.append(time.perf_counter() - t0)
         dense_token_ids.append(int(logit.argmax()))
 
@@ -349,15 +354,13 @@ def main():
 
     avg_stop  = sum(stop_tiles) / n_batch
     med_stop  = sorted(stop_tiles)[n_batch // 2]
-    avg_skip  = sum(skip_pcts)  / n_batch
+    avg_skip  = sum(skip_pcts_)  / n_batch
     avg_spdup = sum(speedups)   / len(speedups)
     med_spdup = sorted(speedups)[len(speedups) // 2]
     alive     = compute_alive_curve(stop_tiles, n_tiles)
 
-    elapsed_total = fwd_elapsed + dsd_wall
-
     print(f"\n{'='*60}")
-    print("DSD Runtime  (lm_head tile-by-tile early stop)")
+    print("DSD Runtime GPU  (lm_head tile-by-tile CUDA early stop)")
     print(f"{'='*60}")
     print(f"  n_users           = {n_batch}")
     print(f"  n_tiles           = {n_tiles}  (chunk_size={chunk_size})")
@@ -381,15 +384,15 @@ def main():
 
     records = [
         {
-            "prompt":       prompts[i],
-            "stop_tile":    stop_tiles[i],
-            "n_tiles":      n_tiles,
-            "skip_pct":     skip_pcts[i],
-            "top1_match":   dsd_token_ids[i] == dense_token_ids[i],
+            "prompt":         prompts[i],
+            "stop_tile":      stop_tiles[i],
+            "n_tiles":        n_tiles,
+            "skip_pct":       skip_pcts_[i],
+            "top1_match":     dsd_token_ids[i] == dense_token_ids[i],
             "dsd_token_id":   dsd_token_ids[i],
             "dense_token_id": dense_token_ids[i],
-            "dsd_elapsed_s":   dsd_times[i],
-            "dense_elapsed_s": dense_times[i],
+            "dsd_elapsed_ms":   round(dsd_times[i] * 1000, 4),
+            "dense_elapsed_ms": round(dense_times[i] * 1000, 4),
         }
         for i in range(n_batch)
     ]
@@ -401,6 +404,7 @@ def main():
         "chunk_size": chunk_size,
         "hidden_dim": hidden_dim,
         "ordering":   "bound_first",
+        "compute":    "CUDA float32 (no CPU transfer)",
         "statistics": {
             "avg_stop_tile":         round(avg_stop, 2),
             "median_stop_tile":      med_stop,
