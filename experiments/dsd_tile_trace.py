@@ -326,24 +326,24 @@ def trace(
     # float32 で全タイルを再累積して差が消えるか確認
     # ----------------------------------------------------------------
     sep("─")
-    print("  [float32 で全タイルを再累積]")
+    print("  [float32 で全タイルを再累積 (W は BF16 のまま chunk 昇格)]")
     dsd32 = (bias.float().clone() if bias is not None
              else torch.zeros(V, dtype=torch.float32, device=h.device))
     nat32 = (bias.float().clone() if bias is not None
              else torch.zeros(V, dtype=torch.float32, device=h.device))
-    W32   = W.float()
-    h32   = h.float()
     h_ord32 = h_ord.float()
+    h32     = h.float()
 
     for tile in range(1, n_tiles + 1):
         ds  = (tile - 1) * chunk_size
         de  = min(tile * chunk_size, H)
         idx = order[ds:de]
-        dsd32.add_(W32[:, idx] @ h_ord32[ds:de])
+        # W の chunk だけ float32 に昇格 (W全体を float32 化しない → OOM 回避)
+        dsd32.add_(W[:, idx].float() @ h_ord32[ds:de])
         for i in range(ds, de):
-            nat32.add_(W32[:, i] * h32[i])
+            nat32.add_(W[:, order[i]].float() * h_ord32[i])
 
-    report_diff(dsd32, nat32, token_a, token_b, "float32 再累積")
+    report_diff(dsd32, nat32, token_a, token_b, "float32 再累積 (chunk 昇格)")
 
     sep("═")
 
