@@ -35,6 +35,104 @@ def sep(char="─", n=90):
     print(char * n)
 
 
+def pairwise_bound_analysis(
+    W: torch.Tensor,
+    h_ord: torch.Tensor,
+    order: torch.Tensor,
+    suffix_B_bf16: torch.Tensor,
+    suffix_B_fp32: torch.Tensor,
+    token_a: int,
+    token_b: int,
+    chunk_size: int,
+    n_tiles: int,
+) -> None:
+    """
+    トークン対 (A, B) に特化したペアワイズ残差上界を計算する。
+
+      real_B_AB[from_dim] =
+          sum_{p=from_dim}^{H-1} |W[A, order[p]] - W[B, order[p]]| * |h_ord[p]|
+
+    全域 suffix_B は max_v|W[v,j]| を使うため real_B_AB より常に大きい (粗い)。
+    もし delta > real_B_AB かつ delta < 2*B(global) なら
+    DSD の停止判定は保守的すぎず、この対に限っては停止が正当化される。
+    逆に delta < real_B_AB なら停止は誤り。
+
+    また BF16 と FP32 の両方で real_B_AB を計算し、
+    BF16 での精度損失がどの程度かを確認する。
+    """
+    H = h_ord.shape[0]
+
+    # W の対応行を float32 で取得 (2行だけなので OOM しない)
+    W_A = W[token_a, :].float()   # (H,) 元の列順
+    W_B = W[token_b, :].float()   # (H,)
+
+    # bound_first 順に並び替え
+    W_A_ord = W_A[order]          # (H,) fp32
+    W_B_ord = W_B[order]          # (H,) fp32
+    h_ord32 = h_ord.float()       # (H,) fp32
+
+    # 各次元の寄与: |W[A,order[p]] - W[B,order[p]]| * |h_ord[p]|
+    pw_contrib_fp32 = (W_A_ord - W_B_ord).abs() * h_ord32.abs()   # (H,) fp32
+    pw_contrib_bf16 = (W[token_a, order] - W[token_b, order]).abs() * h_ord.abs()  # (H,) bf16
+
+    # suffix sum (tile 境界ごと)
+    pw_suffix_fp32 = pw_contrib_fp32.flip(0).cumsum(0).flip(0)     # (H,) fp32
+    pw_suffix_bf16 = pw_contrib_bf16.flip(0).cumsum(0).flip(0)     # (H,) bf16
+
+    sep()
+    print(f"[ペアワイズ残差上界]  token_A={token_a}  token_B={token_b}")
+    sep("─")
+    print(f"  real_B_AB[d] = sum_{{p>=d}} |W[A,order[p]] - W[B,order[p]]| * |h_ord[p]|")
+    print(f"  global suffix_B[d] = sum_{{p>=d}} max_v|W[v,order[p]]| * |h_ord[p]|  (粗い上界)")
+    print()
+    print(f"  {'from_dim':>8}  {'tile':>5}  "
+          f"{'real_B_fp32':>14}  {'real_B_bf16':>14}  "
+          f"{'global_B_fp32':>15}  {'global_B_bf16':>15}  "
+          f"{'ratio real/global':>18}")
+
+    for tile in range(max(1, n_tiles - 5), n_tiles + 1):
+        from_dim = (tile - 1) * chunk_size
+        rB_fp32  = float(pw_suffix_fp32[from_dim]) if from_dim < H else 0.0
+        rB_bf16  = float(pw_suffix_bf16[from_dim]) if from_dim < H else 0.0
+        gB_fp32  = float(suffix_B_fp32[from_dim])  if from_dim < H else 0.0
+        gB_bf16  = float(suffix_B_bf16[from_dim])  if from_dim < H else 0.0
+        ratio    = rB_fp32 / gB_fp32 if gB_fp32 > 0 else float("nan")
+        print(f"  {from_dim:>8}  {tile:>5}  "
+              f"{rB_fp32:>14.6e}  {rB_bf16:>14.6e}  "
+              f"{gB_fp32:>15.6e}  {gB_bf16:>15.6e}  "
+              f"{ratio:>18.6f}")
+
+    # tile 46 終端 (dim=3680) を詳しく確認
+    sep("─")
+    tile46_end = 46 * chunk_size   # = 3680
+    if tile46_end < H:
+        rB46_fp32 = float(pw_suffix_fp32[tile46_end])
+        rB46_bf16 = float(pw_suffix_bf16[tile46_end])
+        gB46_fp32 = float(suffix_B_fp32[tile46_end])
+        gB46_bf16 = float(suffix_B_bf16[tile46_end])
+
+        print(f"  [tile46 終端  dim={tile46_end}]")
+        print(f"    real_B_AB  fp32 = {rB46_fp32:.8e}")
+        print(f"    real_B_AB  bf16 = {rB46_bf16:.8e}")
+        print(f"    global_B   fp32 = {gB46_fp32:.8e}")
+        print(f"    global_B   bf16 = {gB46_bf16:.8e}")
+        print(f"    ratio real/global (fp32) = "
+              f"{rB46_fp32/gB46_fp32 if gB46_fp32 > 0 else 'N/A':.6f}")
+        print()
+        print(f"    寄与合計  fp32 = {float(pw_contrib_fp32[tile46_end:].sum()):.8e}")
+        print(f"    寄与合計  bf16 = {float(pw_contrib_bf16[tile46_end:].sum()):.8e}")
+        print()
+
+        # tile46 以降の各次元の寄与トップ10
+        remaining_contribs = pw_contrib_fp32[tile46_end:].clone()
+        top10_vals, top10_pos = remaining_contribs.topk(min(10, len(remaining_contribs)))
+        print(f"    tile46 以降の寄与トップ10 (ordered_dim, orig_dim, contrib):")
+        for rank, (pos, val) in enumerate(zip(top10_pos.tolist(), top10_vals.tolist())):
+            orig_dim = int(order[tile46_end + pos])
+            print(f"      rank {rank+1:2d}: ordered_pos={tile46_end+pos:4d}  "
+                  f"orig_dim={orig_dim:5d}  contrib={val:.6e}")
+
+
 def trace(
     W: torch.Tensor,
     bias: torch.Tensor | None,
@@ -238,6 +336,28 @@ def trace(
             nat32.add_(W32[:, i] * h32[i])
 
     report_diff(dsd32, nat32, token_a, token_b, "float32 再累積")
+
+    sep("═")
+
+    # ----------------------------------------------------------------
+    # ペアワイズ真の残差上界: real_B_{tokenA}_{tokenB}
+    #
+    # 全域 B (suffix_B) は max_v|W[v,j]| を使う粗い上界。
+    # トークン対 (A, B) だけに着目した真の残差上界は
+    #
+    #   real_B_AB[from_dim] = sum_{p=from_dim}^{H-1}
+    #                           |W[tokenA, order[p]] - W[tokenB, order[p]]|
+    #                           * |h_ord[p]|
+    #
+    # 停止条件  delta > 2*B  の 2*B は real_B_AB より常に大きい (粗い)。
+    # real_B_AB < delta < 2*B の領域なら停止は誤り。
+    # ----------------------------------------------------------------
+    pairwise_bound_analysis(
+        W=W, h_ord=h_ord, order=order,
+        suffix_B_bf16=suffix_B_bf16, suffix_B_fp32=suffix_B_fp32,
+        token_a=token_a, token_b=token_b,
+        chunk_size=chunk_size, n_tiles=n_tiles,
+    )
 
     sep("═")
 
