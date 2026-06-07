@@ -80,17 +80,50 @@ def load_gemma(model_name):
     return tokenizer, model
 
 
-def get_final_hidden(model, input_ids):
-    with torch.no_grad():
-        out = model(input_ids=input_ids, output_hidden_states=True)
-    return out.hidden_states[-1][0, -1, :].detach().cpu().float()
-
-
 def get_lm_head(model):
     lm = model.lm_head
     W    = lm.weight.detach().cpu().float()
     bias = lm.bias.detach().cpu().float() if lm.bias is not None else None
     return W, bias
+
+
+def batch_hidden_states(model, tokenizer, prompts: list[str]) -> torch.Tensor:
+    """
+    全プロンプトを padding=True で一括トークナイズし、
+    model を 1 回だけ forward して最終層 hidden state を返す。
+
+    Returns:
+        h_batch: (N, hidden_dim) float32 CPU tensor
+                 各行が対応プロンプトの最終実トークン位置の hidden vector。
+    """
+    device = next(model.parameters()).device
+
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    )
+    input_ids      = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device)
+
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+
+    # out.hidden_states[-1]: (N, seq_len, hidden_dim)
+    last_hidden = out.hidden_states[-1]   # (N, seq_len, hidden_dim)
+
+    # padding あり → 各サンプルの最後の実トークン位置を取得
+    seq_lens = attention_mask.sum(dim=1) - 1   # (N,) 0-indexed
+    h_batch = last_hidden[
+        torch.arange(last_hidden.size(0), device=device), seq_lens, :
+    ]   # (N, hidden_dim)
+
+    return h_batch.detach().cpu().float()
 
 
 # ---------------------------------------------------------------------------
@@ -245,16 +278,22 @@ def main():
     W, bias = get_lm_head(model)
     print(f"  W.shape={W.shape}  ({time.time()-t0:.1f}s)\n")
 
-    # --- ユーザーごとに推論 ---
+    # --- バッチ forward: 512 ユーザーを 1 回の model() で処理 ---
+    print(f"[forward] {n_batch} ユーザーを一括 forward 中...")
+    t_fwd = time.time()
+    h_batch = batch_hidden_states(model, tokenizer, prompts)   # (N, hidden_dim)
+    fwd_elapsed = time.time() - t_fwd
+    print(f"  h_batch.shape={tuple(h_batch.shape)}  ({fwd_elapsed:.1f}s)\n")
+
+    # --- DSD: ユーザーごとに hidden を取り出して逐次処理 ---
+    print("[dsd] ユーザーごとに DSD を実行中...")
     records = []
     t_start = time.time()
-    for i, prompt in enumerate(prompts):
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-        input_ids = input_ids.to(next(model.parameters()).device)
-        h = get_final_hidden(model, input_ids)
+    for i in range(n_batch):
+        h = h_batch[i]   # (hidden_dim,)
 
         rec = run_user(h, W, bias, chunk_size)
-        rec["prompt"] = prompt
+        rec["prompt"] = prompts[i]
         records.append(rec)
 
         if (i + 1) % max(1, n_batch // 20) == 0 or (i + 1) == n_batch:
@@ -264,9 +303,9 @@ def main():
             print(f"  [{i+1:4d}/{n_batch}]  "
                   f"match={n_match}/{i+1}  "
                   f"avg_skip={avg_skip:.1f}%  "
-                  f"elapsed={elapsed:.1f}s")
+                  f"dsd_elapsed={elapsed:.1f}s")
 
-    elapsed_total = time.time() - t_start
+    elapsed_total = fwd_elapsed + (time.time() - t_start)
 
     # --- 統計 ---
     n_match   = sum(r["top1_match"] for r in records)
