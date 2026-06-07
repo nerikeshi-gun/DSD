@@ -71,18 +71,20 @@ def load_gemma(model_name):
     return tokenizer, model
 
 
-def get_lm_head_gpu(model) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """W と bias を GPU float32 のまま返す。CPU に移さない。"""
-    lm   = model.lm_head
+def get_lm_head_gpu(model, dtype=torch.bfloat16) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """W と bias を GPU 上で指定 dtype のまま返す。CPU に移さない。
+    デフォルト bfloat16 (モデル本体と同 dtype)。float32 コピーは OOM の原因になるため避ける。
+    """
+    lm     = model.lm_head
     device = next(model.parameters()).device
-    W    = lm.weight.detach().to(device=device, dtype=torch.float32)
-    bias = (lm.bias.detach().to(device=device, dtype=torch.float32)
+    W    = lm.weight.detach().to(device=device, dtype=dtype)
+    bias = (lm.bias.detach().to(device=device, dtype=dtype)
             if lm.bias is not None else None)
     return W, bias
 
 
 def batch_hidden_states_gpu(model, tokenizer, prompts: list[str]) -> torch.Tensor:
-    """最終層 hidden state を GPU float32 のまま返す。CPU に移さない。"""
+    """最終層 hidden state を GPU bfloat16 のまま返す。CPU に移さない。"""
     device = next(model.parameters()).device
     enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
     input_ids      = enc["input_ids"].to(device)
@@ -96,7 +98,7 @@ def batch_hidden_states_gpu(model, tokenizer, prompts: list[str]) -> torch.Tenso
     last_hidden = out.hidden_states[-1]                      # (N, seq, H) bfloat16 GPU
     seq_lens    = attention_mask.sum(dim=1) - 1              # (N,)
     h_batch = last_hidden[torch.arange(last_hidden.size(0), device=device), seq_lens, :]
-    return h_batch.detach().to(dtype=torch.float32)          # (N, H) float32 GPU
+    return h_batch.detach()                                  # (N, H) bfloat16 GPU
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +106,8 @@ def batch_hidden_states_gpu(model, tokenizer, prompts: list[str]) -> torch.Tenso
 # ---------------------------------------------------------------------------
 
 def precompute_ordering_gpu(
-    h_batch: torch.Tensor,   # (N, H) float32 GPU
-    W: torch.Tensor,          # (V, H) float32 GPU
+    h_batch: torch.Tensor,   # (N, H) bfloat16 GPU
+    W: torch.Tensor,          # (V, H) bfloat16 GPU
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     bound_first 並び替えと suffix_B を全ユーザー分計算する。
@@ -132,11 +134,11 @@ def precompute_ordering_gpu(
 # ---------------------------------------------------------------------------
 
 def dsd_runtime_single_gpu(
-    bias: torch.Tensor | None,   # (V,) float32 GPU  または None
+    bias: torch.Tensor | None,   # (V,) bfloat16 GPU  または None
     chunk_size: int,
-    suffix_B: torch.Tensor,      # (H,) float32 GPU
-    h_ord: torch.Tensor,         # (H,) float32 GPU
-    W_ord: torch.Tensor,         # (V, H) float32 GPU
+    suffix_B: torch.Tensor,      # (H,) bfloat16 GPU
+    h_ord: torch.Tensor,         # (H,) bfloat16 GPU
+    W_ord: torch.Tensor,         # (V, H) bfloat16 GPU
     n_tiles: int,
 ) -> tuple[int, int, float]:
     """
@@ -146,11 +148,11 @@ def dsd_runtime_single_gpu(
 
     Returns: (token_id, stop_tile, skip_pct)
     """
-    H         = h_ord.shape[0]
+    H          = h_ord.shape[0]
     vocab_size = W_ord.shape[0]
 
     partial_logit = (bias.clone() if bias is not None
-                     else torch.zeros(vocab_size, dtype=torch.float32, device=h_ord.device))
+                     else torch.zeros(vocab_size, dtype=W_ord.dtype, device=h_ord.device))
     stop_tile = n_tiles
 
     for tile in range(1, n_tiles + 1):
@@ -271,10 +273,10 @@ def main():
           f"params={n_params/1e9:.2f}B  device={device}")
     print(f"[batch]  n_users={n_batch}  chunk_size={chunk_size}  n_tiles={n_tiles}\n")
 
-    # --- lm_head を GPU float32 に変換 (CPU に移さない) ---
-    print("[prep] lm_head を GPU float32 に変換中...")
+    # --- lm_head を GPU bfloat16 で保持 (float32 コピーは OOM の原因になるため避ける) ---
+    print("[prep] lm_head を GPU bfloat16 で保持中...")
     t0 = time.time()
-    W, bias = get_lm_head_gpu(model)
+    W, bias = get_lm_head_gpu(model, dtype=torch.bfloat16)
     print(f"  W.shape={W.shape}  device={W.device}  dtype={W.dtype}  ({time.time()-t0:.1f}s)\n")
 
     # --- Step 1: transformer forward ---

@@ -84,16 +84,18 @@ def load_gemma(model_name):
     return tokenizer, model
 
 
-def get_lm_head_gpu(model) -> tuple[torch.Tensor, torch.Tensor | None]:
+def get_lm_head_gpu(model, dtype=torch.bfloat16) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """W と bias を GPU 上で指定 dtype のまま返す。デフォルト bfloat16 (OOM 回避)。"""
     lm     = model.lm_head
     device = next(model.parameters()).device
-    W    = lm.weight.detach().to(device=device, dtype=torch.float32)
-    bias = (lm.bias.detach().to(device=device, dtype=torch.float32)
+    W    = lm.weight.detach().to(device=device, dtype=dtype)
+    bias = (lm.bias.detach().to(device=device, dtype=dtype)
             if lm.bias is not None else None)
     return W, bias
 
 
 def batch_hidden_states_gpu(model, tokenizer, prompts: list[str]) -> torch.Tensor:
+    """最終層 hidden state を GPU bfloat16 のまま返す。"""
     device = next(model.parameters()).device
     enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
     input_ids      = enc["input_ids"].to(device)
@@ -107,7 +109,7 @@ def batch_hidden_states_gpu(model, tokenizer, prompts: list[str]) -> torch.Tenso
     last_hidden = out.hidden_states[-1]
     seq_lens    = attention_mask.sum(dim=1) - 1
     h_batch = last_hidden[torch.arange(last_hidden.size(0), device=device), seq_lens, :]
-    return h_batch.detach().to(dtype=torch.float32)
+    return h_batch.detach()   # bfloat16 GPU
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +124,8 @@ def precompute_ordering_gpu(
     prepared = []
 
     # W_ord サイズ推定 (1 ユーザー分のコピーコスト)
-    bytes_est = W.shape[0] * W.shape[1] * 4   # float32
+    bytes_per_elem = W.element_size()          # bfloat16=2, float32=4
+    bytes_est = W.shape[0] * W.shape[1] * bytes_per_elem
     print(
         f"[estimate] W_ord size = "
         f"{bytes_est / 1024**3:.2f} GB  "
@@ -163,7 +166,7 @@ def dsd_runtime_single_gpu(
     vocab_size = W_ord.shape[0]
 
     partial_logit = (bias.clone() if bias is not None
-                     else torch.zeros(vocab_size, dtype=torch.float32, device=h_ord.device))
+                     else torch.zeros(vocab_size, dtype=W_ord.dtype, device=h_ord.device))
     stop_tile = n_tiles
 
     for tile in range(1, n_tiles + 1):
@@ -229,11 +232,11 @@ def main():
     mem_log = {}
 
     # ------------------------------------------------------------------
-    # 2. lm_head → GPU float32
+    # 2. lm_head → GPU bfloat16 (float32 コピーは OOM の原因のため避ける)
     # ------------------------------------------------------------------
-    print("\n[prep] lm_head を GPU float32 に変換中...")
+    print("\n[prep] lm_head を GPU bfloat16 で保持中...")
     t0 = time.time()
-    W, bias = get_lm_head_gpu(model)
+    W, bias = get_lm_head_gpu(model, dtype=torch.bfloat16)
     print(f"  W.shape={W.shape}  device={W.device}  dtype={W.dtype}  ({time.time()-t0:.1f}s)")
 
     print_gpu_mem("after lm_head")           # ← 計測点 2
@@ -351,19 +354,19 @@ def main():
     avg_skip  = sum(skip_pcts_) / n_batch
     avg_spdup = sum(speedups)   / len(speedups)
 
-    # W_ord 理論サイズ
-    bytes_W_ord_single = W.shape[0] * W.shape[1] * 4
+    # W_ord 理論サイズ (element_size() は dtype に応じて自動: bf16=2, fp32=4)
+    bytes_W_ord_single = W.element_size() * W.shape[0] * W.shape[1]
     bytes_W_ord_all    = bytes_W_ord_single * n_batch
 
     print(f"\n{'='*62}")
     print("DSD Runtime GPU  メモリ診断サマリ")
     print(f"{'='*62}")
     print(f"  W (original)         : {W.element_size() * W.numel() / 1024**3:.2f} GB  "
-          f"(float32, {tuple(W.shape)})")
+          f"({W.dtype}, {tuple(W.shape)})")
     print(f"  W_ord (1 user copy)  : {bytes_W_ord_single / 1024**3:.2f} GB")
     print(f"  W_ord (N={n_batch} users) : {bytes_W_ord_all / 1024**3:.2f} GB  (if all retained)")
     print(f"  h_batch              : {h_batch.element_size() * h_batch.numel() / 1024**2:.1f} MB  "
-          f"(float32, {tuple(h_batch.shape)})")
+          f"({h_batch.dtype}, {tuple(h_batch.shape)})")
     print()
     print(f"  {'Phase':<20s}  {'alloc':>8s}  {'reserved':>10s}")
     print(f"  {'-'*42}")
@@ -395,7 +398,8 @@ def main():
         "hidden_dim": hidden_dim,
         "vocab_size": vocab_size,
         "ordering":   "bound_first",
-        "compute":    "CUDA float32 (no CPU transfer)",
+        "compute":    f"CUDA {W.dtype} (no CPU transfer)",
+        "W_dtype":    str(W.dtype),
         "memory_sizes_gb": {
             "W_original":        round(W.element_size() * W.numel() / 1024**3, 3),
             "W_ord_per_user":    round(bytes_W_ord_single / 1024**3, 3),
