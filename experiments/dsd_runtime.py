@@ -111,8 +111,8 @@ def precompute_ordering_gpu(
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     bound_first 並び替えと suffix_B を全ユーザー分計算する。
-    実機では W の静的スケジューラが事前決定するため計測対象外とする。
-    すべての演算を CUDA 上で完結させる。
+    W_ord は作らない・保持しない。DSD ループ内で W[:, idx] をその場で取得する。
+    保存するのは (order, h_ord, suffix_B) のみ。
     """
     N = h_batch.shape[0]
     prepared = []
@@ -120,12 +120,15 @@ def precompute_ordering_gpu(
         h     = h_batch[i]                                   # (H,) GPU
         order = order_bound_first(h, W)                      # (H,) GPU long
         h_ord = h[order]                                     # (H,) GPU
-        W_ord = W[:, order]                                  # (V, H) GPU
 
-        weight_col_max = W_ord.abs().max(dim=0).values       # (H,) GPU
-        suffix_B = (weight_col_max * h_ord.abs()).flip(0).cumsum(0).flip(0)  # (H,) GPU
+        # suffix_B は W_ord なしで計算できる: W.abs().max(dim=0) は列順不変
+        # bound_contrib を order 順に並べるには W の列を order で gather する必要がある。
+        # W[:, order].abs().max(dim=0) の代わりに列ごとに gather して max を取る。
+        weight_col_max_ord = W[:, order].abs().max(dim=0).values   # (H,) GPU
+        # ↑ ここだけは W[:, order] を一時テンソルとして作るが prepared には保存しない
+        suffix_B = (weight_col_max_ord * h_ord.abs()).flip(0).cumsum(0).flip(0)  # (H,) GPU
 
-        prepared.append((h_ord, W_ord, suffix_B))
+        prepared.append((order, h_ord, suffix_B))
     return prepared
 
 
@@ -134,42 +137,47 @@ def precompute_ordering_gpu(
 # ---------------------------------------------------------------------------
 
 def dsd_runtime_single_gpu(
+    W: torch.Tensor,             # (V, H) bfloat16 GPU  ← 元の W をそのまま渡す
     bias: torch.Tensor | None,   # (V,) bfloat16 GPU  または None
     chunk_size: int,
+    order: torch.Tensor,         # (H,) long GPU  ← bound_first 並び順インデックス
     suffix_B: torch.Tensor,      # (H,) bfloat16 GPU
-    h_ord: torch.Tensor,         # (H,) bfloat16 GPU
-    W_ord: torch.Tensor,         # (V, H) bfloat16 GPU
+    h_ord: torch.Tensor,         # (H,) bfloat16 GPU  ← h[order] 済み
     n_tiles: int,
 ) -> tuple[int, int, float]:
     """
     lm_head を tile-by-tile で CUDA 上で実行し Δ > 2B で break する。
-    break 後の列には一切アクセスしない。
-    Δ, B, topk すべて CUDA テンソルのまま評価する。
+
+    W_ord (並び替え済み W のコピー) は作らない。
+    各タイルで idx = order[dim_start:dim_end] を取得し
+    W[:, idx] @ h_ord[dim_start:dim_end] をその場で計算する。
+    break 後のタイルは計算しない。
 
     Returns: (token_id, stop_tile, skip_pct)
     """
     H          = h_ord.shape[0]
-    vocab_size = W_ord.shape[0]
+    vocab_size = W.shape[0]
 
     partial_logit = (bias.clone() if bias is not None
-                     else torch.zeros(vocab_size, dtype=W_ord.dtype, device=h_ord.device))
+                     else torch.zeros(vocab_size, dtype=W.dtype, device=h_ord.device))
     stop_tile = n_tiles
 
     for tile in range(1, n_tiles + 1):
         dim_start = (tile - 1) * chunk_size
         dim_end   = min(tile * chunk_size, H)
 
-        # このタイルの列だけを CUDA 上でまとめて GEMV
+        # このタイルに対応する元の列インデックスを取得し、その場で gather + GEMV
+        idx = order[dim_start:dim_end]                       # (chunk,) long GPU
         partial_logit.add_(
-            W_ord[:, dim_start:dim_end] @ h_ord[dim_start:dim_end]
+            W[:, idx] @ h_ord[dim_start:dim_end]            # W_ord コピー不要
         )
 
         # Δ と B を CUDA 上で評価
         top2  = partial_logit.topk(2)
-        delta = top2.values[0] - top2.values[1]              # CUDA scalar
+        delta = top2.values[0] - top2.values[1]
         B     = suffix_B[dim_end] if dim_end < H else suffix_B.new_zeros(())
 
-        if delta > 2.0 * B:                                  # .item() 不要: Python bool 評価
+        if delta > 2.0 * B:
             stop_tile = tile
             break
 
@@ -309,12 +317,12 @@ def main():
     torch.cuda.synchronize(device)
     t_loop = time.time()
     for i in range(n_batch):
-        h_ord, W_ord, suffix_B = prepared[i]
+        order, h_ord, suffix_B = prepared[i]
 
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
         token_id, stop_tile, skip_pct = dsd_runtime_single_gpu(
-            bias, chunk_size, suffix_B, h_ord, W_ord, n_tiles,
+            W, bias, chunk_size, order, suffix_B, h_ord, n_tiles,
         )
         torch.cuda.synchronize(device)
         elapsed_i = time.perf_counter() - t0

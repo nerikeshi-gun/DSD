@@ -120,29 +120,31 @@ def precompute_ordering_gpu(
     h_batch: torch.Tensor,
     W: torch.Tensor,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """
+    W_ord は作らない・保持しない。
+    保存するのは (order, h_ord, suffix_B) のみ。
+    """
     N = h_batch.shape[0]
     prepared = []
 
-    # W_ord サイズ推定 (1 ユーザー分のコピーコスト)
     bytes_per_elem = W.element_size()          # bfloat16=2, float32=4
     bytes_est = W.shape[0] * W.shape[1] * bytes_per_elem
     print(
-        f"[estimate] W_ord size = "
+        f"[estimate] W_ord size (per user, NOT retained) = "
         f"{bytes_est / 1024**3:.2f} GB  "
-        f"(per user, {N} users → "
-        f"{bytes_est * N / 1024**3:.2f} GB if all retained)"
+        f"(suffix_B 計算時のみ一時生成)"
     )
 
     for i in range(N):
         h     = h_batch[i]
         order = order_bound_first(h, W)
         h_ord = h[order]
-        W_ord = W[:, order]                              # ← 疑惑の主犯
 
-        weight_col_max = W_ord.abs().max(dim=0).values
-        suffix_B = (weight_col_max * h_ord.abs()).flip(0).cumsum(0).flip(0)
+        # W[:, order] は suffix_B 計算のためだけに一時生成し、保存しない
+        weight_col_max_ord = W[:, order].abs().max(dim=0).values
+        suffix_B = (weight_col_max_ord * h_ord.abs()).flip(0).cumsum(0).flip(0)
 
-        prepared.append((h_ord, W_ord, suffix_B))
+        prepared.append((order, h_ord, suffix_B))   # W_ord は含まない
 
         if (i + 1) % 8 == 0:
             print_gpu_mem(f"precompute {i+1}")
@@ -151,30 +153,36 @@ def precompute_ordering_gpu(
 
 
 # ---------------------------------------------------------------------------
-# DSD ランタイム (GPU tile-by-tile)
+# DSD ランタイム (GPU tile-by-tile、W_ord コピーなし)
 # ---------------------------------------------------------------------------
 
 def dsd_runtime_single_gpu(
+    W: torch.Tensor,             # (V, H) bfloat16 GPU  ← 元の W
     bias: torch.Tensor | None,
     chunk_size: int,
-    suffix_B: torch.Tensor,
-    h_ord: torch.Tensor,
-    W_ord: torch.Tensor,
+    order: torch.Tensor,         # (H,) long GPU
+    suffix_B: torch.Tensor,      # (H,) bfloat16 GPU
+    h_ord: torch.Tensor,         # (H,) bfloat16 GPU
     n_tiles: int,
 ) -> tuple[int, int, float]:
+    """
+    W_ord コピーなし。タイルごとに idx = order[dim_start:dim_end] を取得し
+    W[:, idx] @ h_ord[dim_start:dim_end] をその場で計算する。
+    """
     H          = h_ord.shape[0]
-    vocab_size = W_ord.shape[0]
+    vocab_size = W.shape[0]
 
     partial_logit = (bias.clone() if bias is not None
-                     else torch.zeros(vocab_size, dtype=W_ord.dtype, device=h_ord.device))
+                     else torch.zeros(vocab_size, dtype=W.dtype, device=h_ord.device))
     stop_tile = n_tiles
 
     for tile in range(1, n_tiles + 1):
         dim_start = (tile - 1) * chunk_size
         dim_end   = min(tile * chunk_size, H)
 
+        idx = order[dim_start:dim_end]                       # (chunk,) long GPU
         partial_logit.add_(
-            W_ord[:, dim_start:dim_end] @ h_ord[dim_start:dim_end]
+            W[:, idx] @ h_ord[dim_start:dim_end]
         )
 
         top2  = partial_logit.topk(2)
@@ -293,12 +301,12 @@ def main():
     torch.cuda.synchronize(device)
     t_loop = time.time()
     for i in range(n_batch):
-        h_ord, W_ord, suffix_B = prepared[i]
+        order, h_ord, suffix_B = prepared[i]
 
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
         token_id, stop_tile, skip_pct = dsd_runtime_single_gpu(
-            bias, chunk_size, suffix_B, h_ord, W_ord, n_tiles,
+            W, bias, chunk_size, order, suffix_B, h_ord, n_tiles,
         )
         torch.cuda.synchronize(device)
         elapsed_i = time.perf_counter() - t0
@@ -354,17 +362,18 @@ def main():
     avg_skip  = sum(skip_pcts_) / n_batch
     avg_spdup = sum(speedups)   / len(speedups)
 
-    # W_ord 理論サイズ (element_size() は dtype に応じて自動: bf16=2, fp32=4)
-    bytes_W_ord_single = W.element_size() * W.shape[0] * W.shape[1]
-    bytes_W_ord_all    = bytes_W_ord_single * n_batch
+    # W_ord は保持しない。suffix_B 計算時にのみ一時生成される。
+    bytes_W_ord_tmp = W.element_size() * W.shape[0] * W.shape[1]
 
     print(f"\n{'='*62}")
-    print("DSD Runtime GPU  メモリ診断サマリ")
+    print("DSD Runtime GPU  メモリ診断サマリ  (W_ord 保持なし版)")
     print(f"{'='*62}")
-    print(f"  W (original)         : {W.element_size() * W.numel() / 1024**3:.2f} GB  "
+    print(f"  W (original, shared) : {W.element_size() * W.numel() / 1024**3:.2f} GB  "
           f"({W.dtype}, {tuple(W.shape)})")
-    print(f"  W_ord (1 user copy)  : {bytes_W_ord_single / 1024**3:.2f} GB")
-    print(f"  W_ord (N={n_batch} users) : {bytes_W_ord_all / 1024**3:.2f} GB  (if all retained)")
+    print(f"  W_ord (一時, suffix_B用): {bytes_W_ord_tmp / 1024**3:.2f} GB  "
+          f"← precompute 時のみ, 保存せず即解放")
+    print(f"  DSD ループ内の gather : W[:, idx] per tile  "
+          f"(chunk_size={chunk_size} cols × {W.shape[0]} rows)")
     print(f"  h_batch              : {h_batch.element_size() * h_batch.numel() / 1024**2:.1f} MB  "
           f"({h_batch.dtype}, {tuple(h_batch.shape)})")
     print()
@@ -401,10 +410,10 @@ def main():
         "compute":    f"CUDA {W.dtype} (no CPU transfer)",
         "W_dtype":    str(W.dtype),
         "memory_sizes_gb": {
-            "W_original":        round(W.element_size() * W.numel() / 1024**3, 3),
-            "W_ord_per_user":    round(bytes_W_ord_single / 1024**3, 3),
-            "W_ord_all_users":   round(bytes_W_ord_all    / 1024**3, 3),
-            "h_batch_mb":        round(h_batch.element_size() * h_batch.numel() / 1024**2, 2),
+            "W_original":              round(W.element_size() * W.numel() / 1024**3, 3),
+            "W_ord_tmp_suffix_only":   round(bytes_W_ord_tmp / 1024**3, 3),
+            "W_ord_retained":          0.0,
+            "h_batch_mb":              round(h_batch.element_size() * h_batch.numel() / 1024**2, 2),
         },
         "memory_log": mem_log,
         "statistics": {
