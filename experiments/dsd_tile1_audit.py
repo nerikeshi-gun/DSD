@@ -137,24 +137,71 @@ def run_audit(W, h, weight_col_max, chunk_size):
     print(f"    gemv_fp32[argmax] = {float(gemv_fp32[argmax5]):.6f}")
 
     # ----------------------------------------------------------------
+    # 監査6: manual FP32 accumulator vs GEMV BF16
+    # ----------------------------------------------------------------
+    print(f"\n{sep}")
+    print("監査6: manual FP32 accumulator vs GEMV BF16")
+    print(f"{sep}")
+
+    manual_fp32_acc = torch.zeros(V, dtype=torch.float32, device=W.device)
+    for k in range(len(idx)):
+        manual_fp32_acc.add_(W[:, idx[k]].float() * float(h_ord[ds + k]))
+
+    diff6      = (manual_fp32_acc - gemv_bf16.float()).abs()
+    max_diff6  = float(diff6.max())
+    mean_diff6 = float(diff6.mean())
+    argmax6    = int(diff6.argmax())
+
+    print(f"  max_abs_diff  = {max_diff6:.6e}")
+    print(f"  mean_abs_diff = {mean_diff6:.6e}")
+    print(f"  argmax token  = {argmax6}")
+    print(f"    manual_fp32_acc[argmax] = {float(manual_fp32_acc[argmax6]):.6f}")
+    print(f"    gemv_bf16[argmax]       = {float(gemv_bf16[argmax6]):.6f}")
+
+    # ----------------------------------------------------------------
+    # 監査7: manual FP32 accumulator vs GEMV FP32
+    # ----------------------------------------------------------------
+    print(f"\n{sep}")
+    print("監査7: manual FP32 accumulator vs GEMV FP32")
+    print(f"{sep}")
+
+    diff7      = (manual_fp32_acc - gemv_fp32).abs()
+    max_diff7  = float(diff7.max())
+    mean_diff7 = float(diff7.mean())
+    argmax7    = int(diff7.argmax())
+
+    print(f"  max_abs_diff  = {max_diff7:.6e}")
+    print(f"  mean_abs_diff = {mean_diff7:.6e}")
+    print(f"  argmax token  = {argmax7}")
+    print(f"    manual_fp32_acc[argmax] = {float(manual_fp32_acc[argmax7]):.6f}")
+    print(f"    gemv_fp32[argmax]       = {float(gemv_fp32[argmax7]):.6f}")
+
+    close7 = torch.allclose(manual_fp32_acc, gemv_fp32, atol=1e-3, rtol=1e-3)
+    print(f"  torch.allclose(atol=1e-3, rtol=1e-3) = {close7}")
+
+    # ----------------------------------------------------------------
     # クロス比較サマリ
     # ----------------------------------------------------------------
     print(f"\n{sep}")
     print("サマリ")
     print(f"{sep}")
-    print(f"  監査1  h_ord対応     : {'OK' if eq_check else 'NG ← 添字バグ'}")
-    print(f"  監査2  GEMV vs manual BF16 max_diff : {max_diff2:.6e}")
-    print(f"  監査4  manual BF16 vs FP32 max_diff : {max_diff4:.6e}")
-    print(f"  監査5  GEMV   BF16 vs FP32 max_diff : {max_diff5:.6e}")
+    print(f"  監査1  h_ord対応                          : {'OK' if eq_check else 'NG ← 添字バグ'}")
+    print(f"  監査2  GEMV BF16    vs manual BF16  max   : {max_diff2:.6e}")
+    print(f"  監査4  manual BF16  vs manual FP32  max   : {max_diff4:.6e}")
+    print(f"  監査5  GEMV BF16    vs GEMV FP32    max   : {max_diff5:.6e}")
+    print(f"  監査6  manual FP32  vs GEMV BF16    max   : {max_diff6:.6e}")
+    print(f"  監査7  manual FP32  vs GEMV FP32    max   : {max_diff7:.6e}  allclose={close7}")
 
-    if max_diff2 > 0.1:
-        print("  → GEMV と manual (BF16) で大きな差 ← 演算順序の差が主因")
-    elif max_diff4 > 0.1 or max_diff5 > 0.1:
-        print("  → BF16 vs FP32 で大きな差 ← BF16 丸め誤差が主因")
-    elif not eq_check:
-        print("  → h_ord と h[idx] が不一致 ← 添字バグ")
+    print()
+    if not eq_check:
+        print("  結論D: h_ord と h[idx] が不一致 ← 添字バグ")
+    elif max_diff7 < 1e-2 and max_diff6 < 0.1:
+        print("  結論C: FP32同士は一致。差の原因は BF16 逐次加算誤差 (manual側)")
+        print("         dsd_full_trace の Dense 側が不正確。DSD (GEMV) は正しい。")
+    elif max_diff2 > 0.1:
+        print("  結論B: GEMV BF16 と manual BF16 で大きな差 ← 演算順序差が主因")
     else:
-        print("  → tile=1 では差なし (後タイルで発生 or 比較方法の問題)")
+        print("  結論A/?: tile=1 では有意な差なし (後タイルを調査)")
 
 
 def main():
