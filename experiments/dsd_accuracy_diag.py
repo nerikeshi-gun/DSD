@@ -57,16 +57,56 @@ DEFAULT_PROMPTS = [
 
 
 # ---------------------------------------------------------------------------
-# A. Dense FP32
+# A. Dense FP32  -- vocab チャンク単位で top2 をローリング更新
+#
+# W.float() の全体コピーを作ると ~3.75 GB 追加で OOM になるため、
+# vocab_chunk 行ずつ FP32 に昇格して部分 dot product を計算し、
+# top2 (値・インデックス) だけをローリングで保持する。
+# 全 logit テンソルは保持しない。
 # ---------------------------------------------------------------------------
 
-def dense_fp32(W: torch.Tensor, h: torch.Tensor,
-               bias: torch.Tensor | None) -> torch.Tensor:
-    """W.float() @ h.float()  (一時的に float32 に昇格して計算)"""
-    logit = W.float() @ h.float()
-    if bias is not None:
-        logit = logit + bias.float()
-    return logit
+def dense_fp32_top2(W: torch.Tensor, h: torch.Tensor,
+                    bias: torch.Tensor | None,
+                    vocab_chunk: int = 4096) -> dict:
+    """
+    W を vocab_chunk 行ずつ FP32 に昇格して部分 dot product を計算し、
+    top2 値・インデックスをローリングで更新する。
+
+    W.float() の全体テンソルは作らない。
+    返り値は top2_info 形式の dict。
+    """
+    V   = W.shape[0]
+    h32 = h.float()                                    # (H,) fp32 GPU
+    b32 = bias.float() if bias is not None else None   # (V,) fp32 GPU — bias は小さいので OK
+
+    # ローリング top2: (value, global_vocab_index) を2件保持
+    top2_vals = torch.full((2,), float("-inf"), dtype=torch.float32, device=h.device)
+    top2_idxs = torch.zeros(2, dtype=torch.long, device=h.device)
+
+    for start in range(0, V, vocab_chunk):
+        end   = min(start + vocab_chunk, V)
+        chunk = W[start:end].float() @ h32            # (chunk,) fp32 — 一時テンソル
+        if b32 is not None:
+            chunk = chunk + b32[start:end]
+
+        # このチャンク内 top2
+        k      = min(2, end - start)
+        c_top2 = chunk.topk(k)
+
+        # グローバル top2 とマージ
+        cand_vals = torch.cat([top2_vals, c_top2.values])
+        cand_idxs = torch.cat([top2_idxs, c_top2.indices + start])
+        merged    = cand_vals.topk(2)
+        top2_vals = merged.values
+        top2_idxs = cand_idxs[merged.indices]
+
+    return {
+        "top1_id":    int(top2_idxs[0]),
+        "top2_id":    int(top2_idxs[1]),
+        "top1_logit": round(float(top2_vals[0]), 5),
+        "top2_logit": round(float(top2_vals[1]), 5),
+        "margin":     round(float(top2_vals[0] - top2_vals[1]), 5),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -152,13 +192,14 @@ def compare_sample(
     h_ord  = h[order]
     suffix_B = (weight_col_max[order] * h_ord.abs()).flip(0).cumsum(0).flip(0)
 
-    logit_a = dense_fp32(W, h, bias)
+    # A: FP32 基準 — チャンク単位計算、全 logit テンソル不要
+    info_a = dense_fp32_top2(W, h, bias)
+    # B: BF16 dense — logit 全体が必要 (vocab_size × 2byte は小さい)
     logit_b = dense_bf16(W, h, bias)
+    info_b  = top2_info(logit_b)
+    # C: DSD BF16
     logit_c, stop_tile = dsd_bf16(W, bias, chunk_size, order, suffix_B, h_ord, n_tiles)
-
-    info_a = top2_info(logit_a)
-    info_b = top2_info(logit_b)
-    info_c = top2_info(logit_c)
+    info_c  = top2_info(logit_c)
 
     match_ab = info_a["top1_id"] == info_b["top1_id"]
     match_ac = info_a["top1_id"] == info_c["top1_id"]
