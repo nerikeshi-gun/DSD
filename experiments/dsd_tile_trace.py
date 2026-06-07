@@ -171,16 +171,74 @@ def trace(
             print(f"  *** returned top1={top1_id}  (correct={token_a}) ***")
 
     sep("═")
-    # Dense 自然順の最終 top2
+
+    # ----------------------------------------------------------------
+    # Dense 自然順の最終値を構築
+    # ----------------------------------------------------------------
     dense_nat = (bias.clone() if bias is not None
                  else torch.zeros(V, dtype=W.dtype, device=h.device))
     for i in range(H):
         dense_nat.add_(W[:, i] * h[i])
+
     dn_top2 = dense_nat.topk(2)
     print(f"[Dense BF16 自然順 最終]  "
           f"top1={int(dn_top2.indices[0])}  logit={float(dn_top2.values[0]):.4f}  "
           f"top2={int(dn_top2.indices[1])}  logit={float(dn_top2.values[1]):.4f}  "
           f"margin={float(dn_top2.values[0]-dn_top2.values[1]):.4f}")
+
+    # ----------------------------------------------------------------
+    # dsd_partial (bound_first 累積) vs dense_nat (自然順累積) 差分診断
+    # ----------------------------------------------------------------
+    sep()
+    print("[差分診断]  dsd_partial (bound_first BF16)  vs  dense_nat (natural BF16)")
+    sep("─")
+
+    def report_diff(a: torch.Tensor, b: torch.Tensor,
+                    tok_a: int, tok_b: int, label: str):
+        diff     = a - b
+        abs_diff = diff.abs()
+        print(f"  [{label}]")
+        print(f"    max_abs_diff  = {float(abs_diff.max()):.6e}")
+        print(f"    mean_abs_diff = {float(abs_diff.mean()):.6e}")
+        print(f"    diff[token_A={tok_a}] = {float(diff[tok_a]):>+.6e}  "
+              f"(dsd={float(a[tok_a]):.6f}  dense={float(b[tok_a]):.6f})")
+        print(f"    diff[token_B={tok_b}] = {float(diff[tok_b]):>+.6e}  "
+              f"(dsd={float(a[tok_b]):.6f}  dense={float(b[tok_b]):.6f})")
+        # top1 確認
+        top1_a = int(a.argmax())
+        top1_b = int(b.argmax())
+        print(f"    top1: dsd={top1_a}  dense={top1_b}  match={top1_a == top1_b}")
+        print()
+
+    # BF16 のまま比較
+    report_diff(dsd_partial, dense_nat, token_a, token_b, "BF16")
+
+    # float32 に昇格して再比較
+    report_diff(dsd_partial.float(), dense_nat.float(), token_a, token_b, "float32 昇格後")
+
+    # ----------------------------------------------------------------
+    # float32 で全タイルを再累積して差が消えるか確認
+    # ----------------------------------------------------------------
+    sep("─")
+    print("  [float32 で全タイルを再累積]")
+    dsd32 = (bias.float().clone() if bias is not None
+             else torch.zeros(V, dtype=torch.float32, device=h.device))
+    nat32 = (bias.float().clone() if bias is not None
+             else torch.zeros(V, dtype=torch.float32, device=h.device))
+    W32   = W.float()
+    h32   = h.float()
+    h_ord32 = h_ord.float()
+
+    for tile in range(1, n_tiles + 1):
+        ds  = (tile - 1) * chunk_size
+        de  = min(tile * chunk_size, H)
+        idx = order[ds:de]
+        dsd32.add_(W32[:, idx] @ h_ord32[ds:de])
+        for i in range(ds, de):
+            nat32.add_(W32[:, i] * h32[i])
+
+    report_diff(dsd32, nat32, token_a, token_b, "float32 再累積")
+
     sep("═")
 
 
