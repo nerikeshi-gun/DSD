@@ -18,7 +18,7 @@ experiments/dsd_runtime_memdebug.py  --  DSD ランタイム GPU 版 メモリ�
 import sys, os, json, math, time, torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiments.ordering_exp_v2 import order_bound_first
+from experiments.ordering_exp_v2 import order_bound_first_with_colmax
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MODEL_NAME  = "/home/kaneyama/models/gemma-3-12b-it"
@@ -116,35 +116,39 @@ def batch_hidden_states_gpu(model, tokenizer, prompts: list[str]) -> torch.Tenso
 # 事前計算 (メモリ診断あり)
 # ---------------------------------------------------------------------------
 
+def compute_weight_col_max(W: torch.Tensor, col_chunk: int = 256) -> torch.Tensor:
+    """
+    weight_col_max[j] = max_v |W[v, j]| をチャンク単位で計算する。
+    W.abs() 全体テンソルの生成を避け、一時テンソルを (V, col_chunk) に抑える。
+    """
+    H = W.shape[1]
+    weight_col_max = torch.empty(H, dtype=W.dtype, device=W.device)
+    for start in range(0, H, col_chunk):
+        end = min(start + col_chunk, H)
+        weight_col_max[start:end] = W[:, start:end].abs().max(dim=0).values
+    return weight_col_max
+
+
 def precompute_ordering_gpu(
     h_batch: torch.Tensor,
-    W: torch.Tensor,
+    weight_col_max: torch.Tensor,   # (H,) GPU  ← 外から1回だけ渡す
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
-    W_ord は作らない・保持しない。
-    保存するのは (order, h_ord, suffix_B) のみ。
+    weight_col_max を外から受け取り、W.abs() を呼び出さない。
+    保存するのは (order, h_ord, suffix_B) のみ。W_ord は作らない。
     """
     N = h_batch.shape[0]
     prepared = []
 
-    bytes_per_elem = W.element_size()          # bfloat16=2, float32=4
-    bytes_est = W.shape[0] * W.shape[1] * bytes_per_elem
-    print(
-        f"[estimate] W_ord size (per user, NOT retained) = "
-        f"{bytes_est / 1024**3:.2f} GB  "
-        f"(suffix_B 計算時のみ一時生成)"
-    )
-
     for i in range(N):
         h     = h_batch[i]
-        order = order_bound_first(h, W)
+        order = order_bound_first_with_colmax(h, weight_col_max)
         h_ord = h[order]
 
-        # W[:, order] は suffix_B 計算のためだけに一時生成し、保存しない
-        weight_col_max_ord = W[:, order].abs().max(dim=0).values
-        suffix_B = (weight_col_max_ord * h_ord.abs()).flip(0).cumsum(0).flip(0)
+        # suffix_B: weight_col_max を order 順に並べるだけ (W へのアクセス不要)
+        suffix_B = (weight_col_max[order] * h_ord.abs()).flip(0).cumsum(0).flip(0)
 
-        prepared.append((order, h_ord, suffix_B))   # W_ord は含まない
+        prepared.append((order, h_ord, suffix_B))
 
         if (i + 1) % 8 == 0:
             print_gpu_mem(f"precompute {i+1}")
@@ -248,8 +252,20 @@ def main():
     print(f"  W.shape={W.shape}  device={W.device}  dtype={W.dtype}  ({time.time()-t0:.1f}s)")
 
     print_gpu_mem("after lm_head")           # ← 計測点 2
-    mem_log["after_model_load"] = {"alloc_gb": round(gpu_mem_gb(), 3),
-                                   "reserved_gb": round(gpu_reserved_gb(), 3)}
+    mem_log["after_lm_head"] = {"alloc_gb": round(gpu_mem_gb(), 3),
+                                "reserved_gb": round(gpu_reserved_gb(), 3)}
+
+    # weight_col_max: モデルロード後に1回だけ、チャンク単位で計算
+    # W.abs().max(dim=0) を直接呼ぶと W と同サイズの一時テンソルが生じて OOM になる
+    print("[prep] weight_col_max をチャンク単位で計算中...")
+    t0 = time.time()
+    weight_col_max = compute_weight_col_max(W)
+    torch.cuda.synchronize(device)
+    print(f"  weight_col_max.shape={tuple(weight_col_max.shape)}  ({time.time()-t0:.1f}s)")
+
+    print_gpu_mem("after weight_col_max")
+    mem_log["after_weight_col_max"] = {"alloc_gb": round(gpu_mem_gb(), 3),
+                                       "reserved_gb": round(gpu_reserved_gb(), 3)}
 
     # ------------------------------------------------------------------
     # 3. transformer forward
@@ -277,7 +293,7 @@ def main():
 
     torch.cuda.synchronize(device)
     t_pre = time.time()
-    prepared = precompute_ordering_gpu(h_batch, W)    # ← ループ内で計測点 5
+    prepared = precompute_ordering_gpu(h_batch, weight_col_max)    # ← ループ内で計測点 5
     torch.cuda.synchronize(device)
     print(f"  ({time.time()-t_pre:.1f}s)")
 

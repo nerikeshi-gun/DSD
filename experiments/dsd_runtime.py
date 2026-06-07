@@ -25,7 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiments.ordering_exp_v2 import order_bound_first
+from experiments.ordering_exp_v2 import order_bound_first_with_colmax
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MODEL_NAME  = "/home/kaneyama/models/gemma-3-12b-it"
@@ -102,31 +102,49 @@ def batch_hidden_states_gpu(model, tokenizer, prompts: list[str]) -> torch.Tenso
 
 
 # ---------------------------------------------------------------------------
+# weight_col_max の事前計算 (モデルロード後に1回だけ実行)
+# ---------------------------------------------------------------------------
+
+def compute_weight_col_max(W: torch.Tensor, col_chunk: int = 256) -> torch.Tensor:
+    """
+    weight_col_max[j] = max_v |W[v, j]|  を列チャンク単位で計算する。
+
+    W.abs() を全体で作ると W と同サイズの一時テンソルが生じて OOM になる。
+    col_chunk 列ずつ処理することで一時テンソルを (V, col_chunk) に抑える。
+
+    Returns: (H,) tensor, same dtype/device as W
+    """
+    V, H = W.shape
+    weight_col_max = torch.empty(H, dtype=W.dtype, device=W.device)
+    for start in range(0, H, col_chunk):
+        end = min(start + col_chunk, H)
+        weight_col_max[start:end] = W[:, start:end].abs().max(dim=0).values
+    return weight_col_max
+
+
+# ---------------------------------------------------------------------------
 # 事前計算 (計測対象外)
 # ---------------------------------------------------------------------------
 
 def precompute_ordering_gpu(
-    h_batch: torch.Tensor,   # (N, H) bfloat16 GPU
-    W: torch.Tensor,          # (V, H) bfloat16 GPU
+    h_batch: torch.Tensor,        # (N, H) bfloat16 GPU
+    weight_col_max: torch.Tensor, # (H,) bfloat16 GPU  ← 外から1回だけ渡す
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     bound_first 並び替えと suffix_B を全ユーザー分計算する。
-    W_ord は作らない・保持しない。DSD ループ内で W[:, idx] をその場で取得する。
+    weight_col_max はモデルロード後に1回だけ計算済みのものを受け取る。
+    W_ord は作らない・保持しない。
     保存するのは (order, h_ord, suffix_B) のみ。
     """
     N = h_batch.shape[0]
     prepared = []
     for i in range(N):
-        h     = h_batch[i]                                   # (H,) GPU
-        order = order_bound_first(h, W)                      # (H,) GPU long
-        h_ord = h[order]                                     # (H,) GPU
+        h     = h_batch[i]                                        # (H,) GPU
+        order = order_bound_first_with_colmax(h, weight_col_max)  # (H,) GPU long
+        h_ord = h[order]                                          # (H,) GPU
 
-        # suffix_B は W_ord なしで計算できる: W.abs().max(dim=0) は列順不変
-        # bound_contrib を order 順に並べるには W の列を order で gather する必要がある。
-        # W[:, order].abs().max(dim=0) の代わりに列ごとに gather して max を取る。
-        weight_col_max_ord = W[:, order].abs().max(dim=0).values   # (H,) GPU
-        # ↑ ここだけは W[:, order] を一時テンソルとして作るが prepared には保存しない
-        suffix_B = (weight_col_max_ord * h_ord.abs()).flip(0).cumsum(0).flip(0)  # (H,) GPU
+        # suffix_B: weight_col_max を order 順に並べるだけ (W へのアクセス不要)
+        suffix_B = (weight_col_max[order] * h_ord.abs()).flip(0).cumsum(0).flip(0)  # (H,) GPU
 
         prepared.append((order, h_ord, suffix_B))
     return prepared
@@ -285,7 +303,16 @@ def main():
     print("[prep] lm_head を GPU bfloat16 で保持中...")
     t0 = time.time()
     W, bias = get_lm_head_gpu(model, dtype=torch.bfloat16)
-    print(f"  W.shape={W.shape}  device={W.device}  dtype={W.dtype}  ({time.time()-t0:.1f}s)\n")
+    print(f"  W.shape={W.shape}  device={W.device}  dtype={W.dtype}  ({time.time()-t0:.1f}s)")
+
+    # --- weight_col_max: モデルロード後に1回だけ計算 ---
+    # W.abs().max(dim=0) を直接呼ぶと W と同サイズの一時テンソルが生じて OOM になる。
+    # チャンク単位で処理して一時テンソルを (V, col_chunk) に抑える。
+    print("[prep] weight_col_max をチャンク単位で計算中...")
+    t0 = time.time()
+    weight_col_max = compute_weight_col_max(W)
+    torch.cuda.synchronize(device)
+    print(f"  weight_col_max.shape={tuple(weight_col_max.shape)}  ({time.time()-t0:.1f}s)\n")
 
     # --- Step 1: transformer forward ---
     print(f"[step1/forward] {n_batch} ユーザーを一括 forward 中...")
@@ -301,7 +328,7 @@ def main():
     print("[step2/precompute] bound_first 並び替え + suffix_B (CUDA) ...")
     torch.cuda.synchronize(device)
     t_pre = time.time()
-    prepared = precompute_ordering_gpu(h_batch, W)
+    prepared = precompute_ordering_gpu(h_batch, weight_col_max)
     torch.cuda.synchronize(device)
     print(f"  ({time.time()-t_pre:.1f}s)\n")
 

@@ -96,6 +96,18 @@ def order_bound_first(h: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
     return bound_contrib.argsort(descending=True)
 
 
+def order_bound_first_with_colmax(
+    h: torch.Tensor,
+    weight_col_max: torch.Tensor,
+) -> torch.Tensor:
+    """
+    weight_col_max = max_v|W[v,i]| を事前計算済みで渡す版。
+    W.abs() の全体テンソル生成を回避するために使う。
+    """
+    bound_contrib = weight_col_max * h.abs()     # (hidden_dim,)
+    return bound_contrib.argsort(descending=True)
+
+
 # ---------------------------------------------------------------------------
 # Single-prompt experiment
 # ---------------------------------------------------------------------------
