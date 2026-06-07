@@ -219,6 +219,10 @@ def trace(
         top1_lv = float(top2.values[0])
         top2_lv = float(top2.values[1])
 
+        # topk 値とテンソル直接参照が一致するか照合
+        direct_top1 = float(dsd_partial[top1_id])
+        direct_top2 = float(dsd_partial[top2_id])
+
         delta   = top1_lv - top2_lv
 
         B_bf16  = float(suffix_B_bf16[de]) if de < H else 0.0
@@ -252,8 +256,12 @@ def trace(
         print(f"  diff = logit[A] - logit[B]"
               f"   dsd={dsd_A - dsd_B_:>+10.6f}   dense={den_A - den_B_:>+10.6f}")
         print()
-        print(f"  current_top1  id={top1_id:>7d}   logit={top1_lv:>10.4f}")
-        print(f"  current_top2  id={top2_id:>7d}   logit={top2_lv:>10.4f}")
+        print(f"  current_top1  id={top1_id:>7d}   topk={top1_lv:>10.4f}   "
+              f"dsd_partial[id]={direct_top1:>10.4f}   "
+              f"match={top1_lv == direct_top1}")
+        print(f"  current_top2  id={top2_id:>7d}   topk={top2_lv:>10.4f}   "
+              f"dsd_partial[id]={direct_top2:>10.4f}   "
+              f"match={top2_lv == direct_top2}")
         print()
         print(f"  delta (top1-top2) = {delta:>12.6f}")
         print(f"  B  (bf16)         = {B_bf16:>12.6e}   2B={2*B_bf16:>12.6e}")
