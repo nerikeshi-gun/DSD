@@ -92,14 +92,28 @@ def trace(
         de  = min(tile * chunk_size, H)
         idx = order[ds:de]
 
-        dsd_partial.add_(W[:, idx] @ h_ord[ds:de])
+        # 更新前スナップショット
+        before_A  = float(dsd_partial[token_a])
+        before_B_ = float(dsd_partial[token_b])
+        partial_before = dsd_partial.clone()
+
+        # タイルの寄与ベクトルを別変数で取得してから加算
+        chunk_contrib = W[:, idx] @ h_ord[ds:de]   # (V,) bf16
+        dsd_partial.add_(chunk_contrib)
         dense_partial.add_(W[:, idx] @ h_ord[ds:de])
 
-        # 各値を取得
+        # 更新後
         dsd_A   = float(dsd_partial[token_a])
-        dsd_B_  = float(dsd_partial[token_b])   # 変数名衝突回避
+        dsd_B_  = float(dsd_partial[token_b])
         den_A   = float(dense_partial[token_a])
         den_B_  = float(dense_partial[token_b])
+
+        # 更新量の診断
+        chunk_norm      = float(chunk_contrib.norm())
+        partial_norm    = float(dsd_partial.norm())
+        max_abs_change  = float((dsd_partial - partial_before).abs().max())
+        change_A        = dsd_A  - before_A
+        change_B        = dsd_B_ - before_B_
 
         top2    = dsd_partial.topk(2)
         top1_id = int(top2.indices[0])
@@ -117,6 +131,20 @@ def trace(
         print(f"tile {tile}   dim_start={ds}  dim_end={de}  "
               f"idx[0]={int(idx[0])}..idx[-1]={int(idx[-1])}")
         sep("─")
+
+        # 更新量の診断 (実際に partial_logit が変化しているか)
+        print(f"  [更新量]")
+        print(f"    chunk_norm      = {chunk_norm:.6e}   "
+              f"(このタイルの W[:,idx]@h_ord の L2 norm)")
+        print(f"    partial_norm    = {partial_norm:.6f}   "
+              f"(partial_logit 全体の L2 norm)")
+        print(f"    max_abs_change  = {max_abs_change:.6e}   "
+              f"(partial_logit 全要素の最大変化量)")
+        print(f"    change_A        = {change_A:>+.6e}   "
+              f"(logit[{token_a}] の変化量)")
+        print(f"    change_B        = {change_B:>+.6e}   "
+              f"(logit[{token_b}] の変化量)")
+        print()
 
         print(f"  partial_logit[tokenA={token_a}]  dsd={dsd_A:>10.4f}   dense={den_A:>10.4f}   "
               f"delta_A(dsd-dense)={dsd_A - den_A:>+10.6f}")
