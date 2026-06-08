@@ -8,17 +8,20 @@ only from the Python standard library.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import struct
 from dataclasses import dataclass
+from pathlib import Path
 
 
 N_RANDOM_SEEDS = 1000
 VOCAB_SIZE = 24
 HIDDEN_DIM = 16
 CHUNK_SIZE = 4
-TOP_K = 5
+TOP5_K = 5
+TOP10_K = 10
 
 
 def f32(value: float) -> float:
@@ -82,6 +85,7 @@ def suffix_bounds(order: list[int], h_ord: list[float], col_max: list[float]) ->
 class DSDResult:
     token_id: int
     top5_ids: list[int]
+    top10_ids: list[int]
     stop_tile: int
     n_tiles: int
     skip_rate: float
@@ -135,7 +139,8 @@ def dsd_fp32(
 
     return DSDResult(
         token_id=top_k_indices(partial, 1)[0],
-        top5_ids=top_k_indices(partial, TOP_K),
+        top5_ids=top_k_indices(partial, TOP5_K),
+        top10_ids=top_k_indices(partial, TOP10_K),
         stop_tile=stop_tile,
         n_tiles=n_tiles,
         skip_rate=(n_tiles - stop_tile) / n_tiles,
@@ -204,33 +209,84 @@ def test_delta_greater_than_bound_correctness_on_toy_matrices() -> None:
     assert delayed.token_id == top_k_indices(gemv_fp32(W, delayed_h), 1)[0]
 
 
-def test_randomized_dense_fp32_vs_dsd_fp32_1000_seeds() -> None:
+def margin(logits: list[float]) -> float:
+    """Return top1 - top2 margin for a logit vector."""
+    top2 = top_k_indices(logits, 2)
+    return logits[top2[0]] - logits[top2[1]]
+
+
+def margin_statistics(margins: list[float]) -> dict[str, float]:
+    """Summarize dense FP32 top1/top2 margins over the randomized audit."""
+    sorted_margins = sorted(margins)
+    n = len(sorted_margins)
+    return {
+        "min": sorted_margins[0],
+        "avg": sum(sorted_margins) / n,
+        "p50": sorted_margins[n // 2],
+        "max": sorted_margins[-1],
+    }
+
+
+def dump_failure_cases(failure_cases: list[dict[str, object]], dump_path: Path) -> None:
+    """Persist top1 mismatches with enough context to reproduce the failure."""
+    if failure_cases:
+        dump_path.write_text(json.dumps(failure_cases, indent=2), encoding="utf-8")
+
+
+def test_randomized_dense_fp32_vs_dsd_fp32_1000_seeds(tmp_path: Path) -> None:
     top1_agree = 0
     top5_agree = 0
+    top5_set_agree = 0
+    top10_agree = 0
     stop_tiles: list[int] = []
     skip_rates: list[float] = []
+    dense_margins: list[float] = []
+    failure_cases: list[dict[str, object]] = []
 
     for seed in range(N_RANDOM_SEEDS):
         W, h, bias = random_power_of_two_matrix(seed)
         dense_logits = gemv_fp32(W, h, bias)
         dense_top1 = top_k_indices(dense_logits, 1)[0]
-        dense_top5 = top_k_indices(dense_logits, TOP_K)
+        dense_top5 = top_k_indices(dense_logits, TOP5_K)
+        dense_top10 = top_k_indices(dense_logits, TOP10_K)
         dsd = dsd_fp32(W, h, bias, chunk_size=CHUNK_SIZE)
 
-        top1_agree += int(dsd.token_id == dense_top1)
+        top1_match = dsd.token_id == dense_top1
+        top1_agree += int(top1_match)
         top5_agree += int(dsd.top5_ids == dense_top5)
+        top5_set_agree += int(set(dsd.top5_ids) == set(dense_top5))
+        top10_agree += int(dsd.top10_ids == dense_top10)
+        dense_margins.append(margin(dense_logits))
+        if not top1_match:
+            failure_cases.append(
+                {
+                    "seed": seed,
+                    "dense_top10": dense_top10,
+                    "dsd_top10": dsd.top10_ids,
+                    "stop_tile": dsd.stop_tile,
+                }
+            )
         stop_tiles.append(dsd.stop_tile)
         skip_rates.append(dsd.skip_rate)
+
+    failure_dump_path = tmp_path / "dsd_top1_failures.json"
+    dump_failure_cases(failure_cases, failure_dump_path)
 
     report = {
         "seeds": N_RANDOM_SEEDS,
         "top1_agreement": top1_agree / N_RANDOM_SEEDS,
         "top5_agreement": top5_agree / N_RANDOM_SEEDS,
+        "top5_set_agreement": top5_set_agree / N_RANDOM_SEEDS,
+        "top10_agreement": top10_agree / N_RANDOM_SEEDS,
+        "margin_stats": margin_statistics(dense_margins),
         "average_stop_tile": sum(stop_tiles) / N_RANDOM_SEEDS,
         "average_skip_rate": sum(skip_rates) / N_RANDOM_SEEDS,
+        "failure_case_count": len(failure_cases),
+        "failure_dump_path": str(failure_dump_path) if failure_cases else None,
     }
     print(f"DSD FP32 randomized verification report: {report}")
 
+    assert not failure_cases, f"top1 mismatches dumped to {failure_dump_path}"
     assert top1_agree == N_RANDOM_SEEDS
     assert all(1 <= stop <= math.ceil(HIDDEN_DIM / CHUNK_SIZE) for stop in stop_tiles)
     assert all(0.0 <= skip <= 1.0 for skip in skip_rates)
